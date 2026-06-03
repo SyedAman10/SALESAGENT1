@@ -2,6 +2,7 @@ export const config = {
   anthropicApiKey: process.env.ANTHROPIC_API_KEY!,
   apolloApiKey: process.env.APOLLO_API_KEY ?? '',
   apifyApiKey: process.env.APIFY_API_KEY ?? '',
+  databaseUrl: process.env.DATABASE_URL!,
   smtp: {
     host: process.env.SMTP_HOST ?? '',
     port: parseInt(process.env.SMTP_PORT ?? '587'),

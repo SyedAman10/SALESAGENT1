@@ -4,7 +4,7 @@ import * as cheerio from 'cheerio';
 import nodemailer from 'nodemailer';
 import fs from 'fs';
 import path from 'path';
-import { getDb } from './db';
+import { sql } from './db';
 import { config } from './config';
 
 const client = new Anthropic({ apiKey: config.anthropicApiKey });
@@ -16,9 +16,9 @@ type RawLead = { name: string; email: string; company?: string; linkedin_url?: s
 export async function ingestLeads(targetDomains?: string[]): Promise<{ inserted: number; skipped: number; sources: Record<string, number> }> {
   const portfolio = loadPortfolio(targetDomains);
 
-  const domainSpecificPromises = portfolio.map(asset => {
-    const analysis = getDomainAnalysis(asset.domain);
-    if (!analysis) return Promise.resolve([] as RawLead[]);
+  const domainSpecificPromises = portfolio.map(async asset => {
+    const analysis = await getDomainAnalysis(asset.domain);
+    if (!analysis) return [] as RawLead[];
     return scrapeAllMarketSources(asset, analysis);
   });
 
@@ -44,7 +44,7 @@ export async function ingestLeads(targetDomains?: string[]): Promise<{ inserted:
     }
   }
 
-  const { inserted, skipped } = upsertLeads(raw);
+  const { inserted, skipped } = await upsertLeads(raw);
   return { inserted, skipped, sources };
 }
 
@@ -613,14 +613,15 @@ function isCorporateNonDomainLead(company?: string): boolean {
   return CORPORATE_BLOCKLIST.some(term => lower.includes(term));
 }
 
-function upsertLeads(leads: (RawLead & { source?: string })[]) {
-  const db = getDb();
-  const insert = db.prepare(`INSERT OR IGNORE INTO leads (name, email, company, linkedin_url, source, raw_data, status) VALUES (@name, @email, @company, @linkedin_url, @source, @raw_data, 'new')`);
+async function upsertLeads(leads: (RawLead & { source?: string })[]): Promise<{ inserted: number; skipped: number }> {
   let inserted = 0; let skipped = 0;
   for (const l of leads) {
     if (isCorporateNonDomainLead(l.company)) { skipped++; continue; }
-    const r = insert.run({ name: l.name, email: l.email, company: l.company ?? null, linkedin_url: l.linkedin_url ?? null, source: (l as RawLead & { source?: string }).source ?? 'scrape', raw_data: JSON.stringify(l.raw_data) });
-    r.changes > 0 ? inserted++ : skipped++;
+    const rows = await sql`
+      INSERT INTO leads (name, email, company, linkedin_url, source, raw_data, status)
+      VALUES (${l.name}, ${l.email}, ${l.company ?? null}, ${l.linkedin_url ?? null}, ${(l as RawLead & { source?: string }).source ?? 'scrape'}, ${JSON.stringify(l.raw_data)}, 'new')
+      ON CONFLICT (email) DO NOTHING RETURNING id`;
+    rows.length > 0 ? inserted++ : skipped++;
   }
   return { inserted, skipped };
 }
@@ -673,7 +674,7 @@ export async function findHotLeads(targetDomains?: string[]): Promise<{ inserted
     addLeads(flippaResult.leads);
   }
 
-  const { inserted, skipped } = upsertLeads(allLeads);
+  const { inserted, skipped } = await upsertLeads(allLeads);
   return { inserted, skipped, sources, threads: 0, errors };
 }
 
@@ -1143,7 +1144,7 @@ export async function testApifyApollo(targetDomains?: string[]): Promise<{ inser
   const errors: Record<string, string> = {};
 
   for (const asset of portfolio) {
-    const analysis = getDomainAnalysis(asset.domain);
+    const analysis = await getDomainAnalysis(asset.domain);
     const rootKw = asset.domain.split('.')[0];
     const industryKws = analysis?.industries.slice(0, 2).map(i => i.split(' ')[0]) ?? [];
     const keywords = [...new Set([rootKw, ...industryKws])].filter(k => k.length > 2).slice(0, 3);
@@ -1320,7 +1321,7 @@ export async function testApifyApollo(targetDomains?: string[]): Promise<{ inser
     }
   }
 
-  const { inserted, skipped } = upsertLeads(allLeads);
+  const { inserted, skipped } = await upsertLeads(allLeads);
   const sources: Record<string, number> = {};
   for (const l of allLeads) { const src = l.source ?? 'unknown'; sources[src] = (sources[src] ?? 0) + 1; }
   return { inserted, skipped, sources, breakdown, errors };
@@ -1340,9 +1341,7 @@ export interface LeadEnrichment {
 }
 
 export async function enrichLeads(): Promise<{ enriched: number; skipped: number; failed: number }> {
-  const db = getDb();
-  const leads = db.prepare(`SELECT id, name, email, company, raw_data FROM leads WHERE enrichment IS NULL AND status = 'new'`).all() as LeadRow[];
-  const update = db.prepare(`UPDATE leads SET enrichment = @enrichment, score = @score, status = @status WHERE id = @id`);
+  const leads = await sql`SELECT id, name, email, company, raw_data FROM leads WHERE enrichment IS NULL AND status = 'new'` as LeadRow[];
 
   let enriched = 0; let skipped = 0; let failed = 0;
   const BATCH = 5;
@@ -1366,7 +1365,7 @@ export async function enrichLeads(): Promise<{ enriched: number; skipped: number
       if (r.status === 'fulfilled') {
         const { lead, result } = r.value;
         const status = result.score >= config.leadScoreThreshold ? 'enriched' : 'skipped';
-        update.run({ enrichment: JSON.stringify(result), score: result.score, status, id: lead.id });
+        await sql`UPDATE leads SET enrichment = ${JSON.stringify(result)}, score = ${result.score}, status = ${status} WHERE id = ${lead.id}`;
         status === 'enriched' ? enriched++ : skipped++;
       } else {
         failed++;
@@ -1423,22 +1422,18 @@ export function getPortfolio(): Asset[] {
   return loadPortfolio();
 }
 
-function getDomainAnalysis(domain: string): DomainAnalysis | null {
-  const db = getDb();
-  const row = db.prepare('SELECT analysis FROM domain_analyses WHERE domain = ?').get(domain) as { analysis: string } | undefined;
-  return row ? JSON.parse(row.analysis) as DomainAnalysis : null;
+async function getDomainAnalysis(domain: string): Promise<DomainAnalysis | null> {
+  const rows = await sql`SELECT analysis FROM domain_analyses WHERE domain = ${domain}`;
+  return rows[0] ? JSON.parse((rows[0] as { analysis: string }).analysis) as DomainAnalysis : null;
 }
 
 export async function analyzeDomains(targetDomains?: string[]): Promise<{ analyzed: number; skipped: number }> {
-  const db = getDb();
   const portfolio = loadPortfolio(targetDomains);
-  const upsert = db.prepare(`INSERT OR REPLACE INTO domain_analyses (domain, analysis) VALUES (@domain, @analysis)`);
-
   let analyzed = 0; let skipped = 0;
 
   for (const asset of portfolio) {
-    const existing = db.prepare('SELECT id FROM domain_analyses WHERE domain = ?').get(asset.domain);
-    if (existing) { skipped++; continue; }
+    const existing = await sql`SELECT id FROM domain_analyses WHERE domain = ${asset.domain}`;
+    if (existing.length) { skipped++; continue; }
 
     try {
       const res = await client.messages.create({
@@ -1449,7 +1444,7 @@ export async function analyzeDomains(targetDomains?: string[]): Promise<{ analyz
 
       const text = res.content[0].type === 'text' ? res.content[0].text : '';
       const result = JSON.parse(text.replace(/```json\n?|\n?```/g, '').trim()) as DomainAnalysis;
-      upsert.run({ domain: asset.domain, analysis: JSON.stringify(result) });
+      await sql`INSERT INTO domain_analyses (domain, analysis) VALUES (${asset.domain}, ${JSON.stringify(result)}) ON CONFLICT (domain) DO UPDATE SET analysis = EXCLUDED.analysis`;
       analyzed++;
     } catch { skipped++; }
 
@@ -1491,17 +1486,14 @@ Return valid JSON only.`;
 // ── MATCH ─────────────────────────────────────────────────────────────────────
 
 export async function matchDomains(targetDomains?: string[]): Promise<{ matched: number; unmatched: number }> {
-  const db = getDb();
   const portfolio = loadPortfolio(targetDomains);
   if (!portfolio.length) throw new Error('domains.json is empty');
 
-  const leads = db.prepare(`SELECT id, name, email, enrichment FROM leads WHERE status = 'enriched' AND id NOT IN (SELECT DISTINCT lead_id FROM lead_domain_matches)`).all() as { id: number; name: string; email: string; enrichment: string }[];
-  const insert = db.prepare(`INSERT OR IGNORE INTO lead_domain_matches (lead_id, domain, relevance_reasoning) VALUES (@lead_id, @domain, @relevance_reasoning)`);
-  const noMatch = db.prepare(`UPDATE leads SET status = 'no_match' WHERE id = ?`);
+  const leads = await sql`SELECT id, name, email, enrichment FROM leads WHERE status = 'enriched' AND id NOT IN (SELECT DISTINCT lead_id FROM lead_domain_matches)` as { id: number; name: string; email: string; enrichment: string }[];
 
   const analyses = new Map<string, DomainAnalysis>();
   for (const asset of portfolio) {
-    const a = getDomainAnalysis(asset.domain);
+    const a = await getDomainAnalysis(asset.domain);
     if (a) analyses.set(asset.domain, a);
   }
 
@@ -1524,8 +1516,8 @@ export async function matchDomains(targetDomains?: string[]): Promise<{ matched:
     for (const r of results) {
       if (r.status === 'fulfilled') {
         const { lead, matches } = r.value;
-        if (!matches.length) { noMatch.run(lead.id); unmatched++; }
-        else { matches.forEach(m => insert.run({ lead_id: lead.id, domain: m.domain, relevance_reasoning: m.relevance_reasoning })); matched++; }
+        if (!matches.length) { await sql`UPDATE leads SET status = 'no_match' WHERE id = ${lead.id}`; unmatched++; }
+        else { for (const m of matches) { await sql`INSERT INTO lead_domain_matches (lead_id, domain, relevance_reasoning) VALUES (${lead.id}, ${m.domain}, ${m.relevance_reasoning}) ON CONFLICT (lead_id, domain) DO NOTHING`; } matched++; }
       } else { unmatched++; }
     }
     if (i + BATCH < leads.length) await sleep(200);
@@ -1564,20 +1556,18 @@ Return valid JSON only.`;
 // ── WRITE ─────────────────────────────────────────────────────────────────────
 
 export async function writeEmails(): Promise<{ written: number }> {
-  const db = getDb();
-  const leads = db.prepare(`SELECT DISTINCT l.id, l.name, l.email, l.company, l.enrichment, l.raw_data FROM leads l INNER JOIN lead_domain_matches ldm ON ldm.lead_id = l.id WHERE l.status = 'enriched' AND l.id NOT IN (SELECT DISTINCT lead_id FROM emails WHERE sequence_day = 1)`).all() as (LeadRow & { raw_data: string })[];
-  const insert = db.prepare(`INSERT INTO emails (lead_id, domain, subject, body, variant, status, sequence_day) VALUES (@lead_id, @domain, @subject, @body, @variant, 'pending', 1)`);
+  const leads = await sql`SELECT DISTINCT l.id, l.name, l.email, l.company, l.enrichment, l.raw_data FROM leads l INNER JOIN lead_domain_matches ldm ON ldm.lead_id = l.id WHERE l.status = 'enriched' AND l.id NOT IN (SELECT DISTINCT lead_id FROM emails WHERE sequence_day = 1)` as (LeadRow & { raw_data: string })[];
   let written = 0;
 
   for (const lead of leads) {
     const enrichment = JSON.parse(lead.enrichment) as LeadEnrichment;
-    const matches = db.prepare(`SELECT domain, relevance_reasoning FROM lead_domain_matches WHERE lead_id = ?`).all(lead.id) as { domain: string; relevance_reasoning: string }[];
+    const matches = await sql`SELECT domain, relevance_reasoning FROM lead_domain_matches WHERE lead_id = ${lead.id}` as { domain: string; relevance_reasoning: string }[];
 
     // Research the company homepage for personalization context
     const companyContext = await researchCompany(lead.email, lead.company, lead.raw_data);
 
     for (const match of matches) {
-      const analysis = getDomainAnalysis(match.domain);
+      const analysis = await getDomainAnalysis(match.domain);
       for (const variant of ['direct', 'curious', 'value-led'] as const) {
         try {
           const res = await client.messages.create({
@@ -1586,7 +1576,7 @@ export async function writeEmails(): Promise<{ written: number }> {
           });
           const text = res.content[0].type === 'text' ? res.content[0].text : '';
           const parsed = JSON.parse(text.replace(/```json\n?|\n?```/g, '').trim()) as { subject: string; body: string };
-          insert.run({ lead_id: lead.id, domain: match.domain, subject: parsed.subject, body: parsed.body, variant });
+          await sql`INSERT INTO emails (lead_id, domain, subject, body, variant, status, sequence_day) VALUES (${lead.id}, ${match.domain}, ${parsed.subject}, ${parsed.body}, ${variant}, 'pending', 1)`;
           written++;
         } catch { /* skip variant */ }
         await sleep(400);
@@ -1663,23 +1653,22 @@ Return JSON only: {"subject": "...", "body": "..."}`;
 // ── SEQUENCE ──────────────────────────────────────────────────────────────────
 
 export async function writeFollowUps(): Promise<{ written: number }> {
-  const db = getDb();
   type ContactedRow = { id: number; name: string; company: string | null; enrichment: string; domain: string; day1_body: string };
 
-  const contacted = db.prepare(`
+  const contacted = await sql`
     SELECT DISTINCT l.id, l.name, l.company, l.enrichment, e.domain, e.body as day1_body
     FROM leads l
     INNER JOIN emails e ON e.lead_id = l.id
     WHERE l.status = 'contacted' AND e.status = 'sent' AND e.sequence_day = 1
-  `).all() as ContactedRow[];
+  ` as ContactedRow[];
 
   let written = 0;
 
   for (const lead of contacted) {
-    const analysis = getDomainAnalysis(lead.domain);
+    const analysis = await getDomainAnalysis(lead.domain);
     for (const day of [3, 5, 7]) {
-      const exists = db.prepare('SELECT id FROM emails WHERE lead_id = ? AND domain = ? AND sequence_day = ?').get(lead.id, lead.domain, day);
-      if (exists) continue;
+      const existing = await sql`SELECT id FROM emails WHERE lead_id = ${lead.id} AND domain = ${lead.domain} AND sequence_day = ${day}`;
+      if (existing.length) continue;
       try {
         const res = await client.messages.create({
           model: config.model, max_tokens: 400,
@@ -1687,8 +1676,7 @@ export async function writeFollowUps(): Promise<{ written: number }> {
         });
         const text = res.content[0].type === 'text' ? res.content[0].text : '';
         const parsed = JSON.parse(text.replace(/```json\n?|\n?```/g, '').trim()) as { subject: string; body: string };
-        db.prepare(`INSERT INTO emails (lead_id, domain, subject, body, variant, status, sequence_day) VALUES (@lead_id, @domain, @subject, @body, @variant, 'approved', @day)`)
-          .run({ lead_id: lead.id, domain: lead.domain, subject: parsed.subject, body: parsed.body, variant: `day${day}`, day });
+        await sql`INSERT INTO emails (lead_id, domain, subject, body, variant, status, sequence_day) VALUES (${lead.id}, ${lead.domain}, ${parsed.subject}, ${parsed.body}, ${`day${day}`}, 'approved', ${day})`;
         written++;
       } catch { /* skip */ }
       await sleep(300);
@@ -1735,21 +1723,17 @@ Return valid JSON only.`;
 // ── DECIDE ────────────────────────────────────────────────────────────────────
 
 export async function decideAndApprove(): Promise<{ approved: number }> {
-  const db = getDb();
   const portfolio = loadPortfolio();
   const priceMap = new Map(portfolio.map(a => [a.domain, a.asking_price]));
 
-  const leads = db.prepare(`SELECT DISTINCT l.id, l.name, l.email, l.enrichment, l.score FROM leads l INNER JOIN emails e ON e.lead_id = l.id WHERE l.status = 'enriched' AND e.status = 'pending' AND e.sequence_day = 1`).all() as (LeadRow & { score: number })[];
-
-  const markApproved = db.prepare(`UPDATE emails SET status = 'approved', body = @body, subject = @subject WHERE id = @id`);
-  const markRejected = db.prepare(`UPDATE emails SET status = 'rejected' WHERE lead_id = @lead_id AND id != @keep_id AND sequence_day = 1`);
+  const leads = await sql`SELECT DISTINCT l.id, l.name, l.email, l.enrichment, l.score FROM leads l INNER JOIN emails e ON e.lead_id = l.id WHERE l.status = 'enriched' AND e.status = 'pending' AND e.sequence_day = 1` as (LeadRow & { score: number })[];
 
   let approved = 0;
 
   for (const lead of leads) {
     if (lead.score < config.leadScoreThreshold) continue;
     const enrichment = JSON.parse(lead.enrichment) as LeadEnrichment;
-    const variants = db.prepare(`SELECT id, lead_id, domain, subject, body, variant FROM emails WHERE lead_id = ? AND status = 'pending' AND sequence_day = 1`).all(lead.id) as { id: number; lead_id: number; domain: string; subject: string; body: string; variant: string }[];
+    const variants = await sql`SELECT id, lead_id, domain, subject, body, variant FROM emails WHERE lead_id = ${lead.id} AND status = 'pending' AND sequence_day = 1` as { id: number; lead_id: number; domain: string; subject: string; body: string; variant: string }[];
 
     const byDomain = new Map<string, typeof variants>();
     for (const v of variants) { const g = byDomain.get(v.domain) ?? []; g.push(v); byDomain.set(v.domain, g); }
@@ -1761,8 +1745,8 @@ export async function decideAndApprove(): Promise<{ approved: number }> {
         const best = await pickVariant(enrichment, dvariants);
         const finalSubject = best.subject.replace(/\[PRICE\]/g, `$${price.toLocaleString()}`);
         const finalBody = best.body.replace(/\[PRICE\]/g, `$${price.toLocaleString()}`);
-        markApproved.run({ body: finalBody, subject: finalSubject, id: best.id });
-        markRejected.run({ lead_id: lead.id, keep_id: best.id });
+        await sql`UPDATE emails SET status = 'approved', body = ${finalBody}, subject = ${finalSubject} WHERE id = ${best.id}`;
+        await sql`UPDATE emails SET status = 'rejected' WHERE lead_id = ${lead.id} AND id != ${best.id} AND sequence_day = 1`;
         approved++;
       } catch { /* skip */ }
     }
@@ -1785,32 +1769,33 @@ async function pickVariant(enrichment: LeadEnrichment, variants: { id: number; s
 // ── SEND ──────────────────────────────────────────────────────────────────────
 
 export async function sendApproved(): Promise<{ sent: number; failed: number }> {
-  const db = getDb();
   const transport = nodemailer.createTransport({ host: config.smtp.host, port: config.smtp.port, secure: config.smtp.port === 465, auth: { user: config.smtp.user, pass: config.smtp.pass } });
 
-  const sentToday = (db.prepare(`SELECT COUNT(*) as c FROM send_log WHERE date(sent_at) = date('now')`).get() as { c: number }).c;
+  const sentTodayRows = await sql`SELECT COUNT(*) as c FROM send_log WHERE sent_at::date = CURRENT_DATE`;
+  const sentToday = Number((sentTodayRows[0] as { c: string | number }).c ?? 0);
   const remaining = config.dailySendLimit - sentToday;
   if (remaining <= 0) return { sent: 0, failed: 0 };
 
   type SendItem = { id: number; lead_id: number; domain: string; subject: string; body: string; sequence_day: number };
 
-  const day1 = db.prepare(`
+  const day1 = await sql`
     SELECT e.id, e.lead_id, e.domain, e.subject, e.body, e.sequence_day
     FROM emails e INNER JOIN leads l ON l.id = e.lead_id
     WHERE e.status = 'approved' AND e.sequence_day = 1 AND l.status = 'enriched'
     ORDER BY l.score DESC
-  `).all() as SendItem[];
+  ` as SendItem[];
 
-  type FollowUpRow = SendItem & { day1_sent: string | null };
-  const dueFollowUps = (db.prepare(`
+  type FollowUpRow = SendItem & { day1_sent: Date | string | null };
+  const dueFollowUpsAll = await sql`
     SELECT e.id, e.lead_id, e.domain, e.subject, e.body, e.sequence_day,
            (SELECT MAX(e2.sent_at) FROM emails e2 WHERE e2.lead_id = e.lead_id AND e2.status = 'sent' AND e2.sequence_day = 1) as day1_sent
     FROM emails e INNER JOIN leads l ON l.id = e.lead_id
     WHERE e.status = 'approved' AND e.sequence_day > 1 AND l.status = 'contacted'
     ORDER BY l.score DESC
-  `).all() as FollowUpRow[]).filter(e => {
+  ` as FollowUpRow[];
+  const dueFollowUps = dueFollowUpsAll.filter(e => {
     if (!e.day1_sent) return false;
-    const daysPassed = (Date.now() - new Date(e.day1_sent + 'Z').getTime()) / 86400000;
+    const daysPassed = (Date.now() - new Date(e.day1_sent as string).getTime()) / 86400000;
     return daysPassed >= e.sequence_day - 1;
   });
 
@@ -1818,16 +1803,17 @@ export async function sendApproved(): Promise<{ sent: number; failed: number }> 
   let sent = 0; let failed = 0;
 
   for (const email of queue) {
-    const lead = db.prepare('SELECT name, email FROM leads WHERE id = ?').get(email.lead_id) as { name: string; email: string };
+    const leadRows = await sql`SELECT name, email FROM leads WHERE id = ${email.lead_id}`;
+    const lead = leadRows[0] as { name: string; email: string };
     const bodyWithFooter = `${email.body}\n\n---\nTo unsubscribe: ${config.baseUrl}/api/unsubscribe?email=${encodeURIComponent(lead.email)}`;
     try {
       await transport.sendMail({ from: `"${config.fromName}" <${config.fromEmail}>`, to: lead.email, bcc: config.fromEmail, subject: email.subject, text: bodyWithFooter });
-      db.prepare(`UPDATE emails SET status = 'sent', sent_at = datetime('now') WHERE id = ?`).run(email.id);
-      if (email.sequence_day === 1) db.prepare(`UPDATE leads SET status = 'contacted' WHERE id = ?`).run(email.lead_id);
-      db.prepare(`INSERT INTO send_log (email_id, result) VALUES (?, 'ok')`).run(email.id);
+      await sql`UPDATE emails SET status = 'sent', sent_at = NOW() WHERE id = ${email.id}`;
+      if (email.sequence_day === 1) await sql`UPDATE leads SET status = 'contacted' WHERE id = ${email.lead_id}`;
+      await sql`INSERT INTO send_log (email_id, result) VALUES (${email.id}, 'ok')`;
       sent++;
     } catch (e) {
-      db.prepare(`INSERT INTO send_log (email_id, result) VALUES (?, ?)`).run(email.id, `error: ${(e as Error).message}`);
+      await sql`INSERT INTO send_log (email_id, result) VALUES (${email.id}, ${`error: ${(e as Error).message}`})`;
       failed++;
     }
     await sleep(10000 + Math.random() * 5000);
@@ -1840,14 +1826,14 @@ export async function sendApproved(): Promise<{ sent: number; failed: number }> 
 type Emitter = (data: object) => void;
 
 export async function sendApprovedStream(emit: Emitter): Promise<void> {
-  const db = getDb();
   const transport = nodemailer.createTransport({
     host: config.smtp.host, port: config.smtp.port,
     secure: config.smtp.port === 465,
     auth: { user: config.smtp.user, pass: config.smtp.pass },
   });
 
-  const sentToday = (db.prepare(`SELECT COUNT(*) as c FROM send_log WHERE date(sent_at) = date('now')`).get() as { c: number }).c;
+  const sentTodayRows = await sql`SELECT COUNT(*) as c FROM send_log WHERE sent_at::date = CURRENT_DATE`;
+  const sentToday = Number((sentTodayRows[0] as { c: string | number }).c ?? 0);
   const remaining = config.dailySendLimit - sentToday;
 
   if (remaining <= 0) {
@@ -1857,23 +1843,24 @@ export async function sendApprovedStream(emit: Emitter): Promise<void> {
 
   type SendItem = { id: number; lead_id: number; domain: string; subject: string; body: string; sequence_day: number };
 
-  const day1 = db.prepare(`
+  const day1 = await sql`
     SELECT e.id, e.lead_id, e.domain, e.subject, e.body, e.sequence_day
     FROM emails e INNER JOIN leads l ON l.id = e.lead_id
     WHERE e.status = 'approved' AND e.sequence_day = 1 AND l.status = 'enriched'
     ORDER BY l.score DESC
-  `).all() as SendItem[];
+  ` as SendItem[];
 
-  type FollowUpRow = SendItem & { day1_sent: string | null };
-  const dueFollowUps = (db.prepare(`
+  type FollowUpRow = SendItem & { day1_sent: Date | string | null };
+  const dueFollowUpsAll = await sql`
     SELECT e.id, e.lead_id, e.domain, e.subject, e.body, e.sequence_day,
            (SELECT MAX(e2.sent_at) FROM emails e2 WHERE e2.lead_id = e.lead_id AND e2.status = 'sent' AND e2.sequence_day = 1) as day1_sent
     FROM emails e INNER JOIN leads l ON l.id = e.lead_id
     WHERE e.status = 'approved' AND e.sequence_day > 1 AND l.status = 'contacted'
     ORDER BY l.score DESC
-  `).all() as FollowUpRow[]).filter(e => {
+  ` as FollowUpRow[];
+  const dueFollowUps = dueFollowUpsAll.filter(e => {
     if (!e.day1_sent) return false;
-    const daysPassed = (Date.now() - new Date(e.day1_sent + 'Z').getTime()) / 86400000;
+    const daysPassed = (Date.now() - new Date(e.day1_sent as string).getTime()) / 86400000;
     return daysPassed >= e.sequence_day - 1;
   });
 
@@ -1884,18 +1871,19 @@ export async function sendApprovedStream(emit: Emitter): Promise<void> {
   let sent = 0; let failed = 0;
 
   for (const email of queue) {
-    const lead = db.prepare('SELECT name, email FROM leads WHERE id = ?').get(email.lead_id) as { name: string; email: string };
+    const leadRows = await sql`SELECT name, email FROM leads WHERE id = ${email.lead_id}`;
+    const lead = leadRows[0] as { name: string; email: string };
     const label = email.sequence_day > 1 ? `Day ${email.sequence_day} follow-up` : 'Day 1';
     const bodyWithFooter = `${email.body}\n\n---\nTo unsubscribe: ${config.baseUrl}/api/unsubscribe?email=${encodeURIComponent(lead.email)}`;
     try {
       await transport.sendMail({ from: `"${config.fromName}" <${config.fromEmail}>`, to: lead.email, bcc: config.fromEmail, subject: email.subject, text: bodyWithFooter });
-      db.prepare(`UPDATE emails SET status = 'sent', sent_at = datetime('now') WHERE id = ?`).run(email.id);
-      if (email.sequence_day === 1) db.prepare(`UPDATE leads SET status = 'contacted' WHERE id = ?`).run(email.lead_id);
-      db.prepare(`INSERT INTO send_log (email_id, result) VALUES (?, 'ok')`).run(email.id);
+      await sql`UPDATE emails SET status = 'sent', sent_at = NOW() WHERE id = ${email.id}`;
+      if (email.sequence_day === 1) await sql`UPDATE leads SET status = 'contacted' WHERE id = ${email.lead_id}`;
+      await sql`INSERT INTO send_log (email_id, result) VALUES (${email.id}, 'ok')`;
       sent++;
       emit({ type: 'sent', message: `✓ ${lead.email} (${email.domain}) [${label}]`, sent, total: queue.length });
     } catch (e) {
-      db.prepare(`INSERT INTO send_log (email_id, result) VALUES (?, ?)`).run(email.id, `error: ${(e as Error).message}`);
+      await sql`INSERT INTO send_log (email_id, result) VALUES (${email.id}, ${`error: ${(e as Error).message}`})`;
       failed++;
       emit({ type: 'failed', message: `✗ ${lead.email}: ${(e as Error).message}` });
     }
@@ -1911,40 +1899,35 @@ export async function sendApprovedStream(emit: Emitter): Promise<void> {
 
 // ── STATS ─────────────────────────────────────────────────────────────────────
 
-export function getStats() {
-  const db = getDb();
-  const statusCounts = db.prepare(`SELECT status, COUNT(*) as count FROM leads GROUP BY status`).all() as { status: string; count: number }[];
-  const byStatus = Object.fromEntries(statusCounts.map(r => [r.status, r.count]));
-  const sentToday = (db.prepare(`SELECT COUNT(*) as c FROM send_log WHERE date(sent_at) = date('now')`).get() as { c: number }).c;
-  const sentTotal = (db.prepare(`SELECT COUNT(*) as c FROM send_log WHERE result = 'ok'`).get() as { c: number }).c;
-  const replies = (db.prepare(`SELECT COUNT(*) as c FROM leads WHERE status = 'replied'`).get() as { c: number }).c;
-  const approved = (db.prepare(`SELECT COUNT(*) as c FROM emails WHERE status = 'approved' AND sequence_day = 1`).get() as { c: number }).c;
-  const sourceCounts = db.prepare(`SELECT source, COUNT(*) as count FROM leads GROUP BY source ORDER BY count DESC`).all() as { source: string; count: number }[];
-  const bySources = Object.fromEntries(sourceCounts.map(r => [r.source, r.count]));
+export async function getStats() {
+  const statusCounts = await sql`SELECT status, COUNT(*) as count FROM leads GROUP BY status` as { status: string; count: string | number }[];
+  const byStatus = Object.fromEntries(statusCounts.map(r => [r.status, Number(r.count)]));
+  const sentToday = Number(((await sql`SELECT COUNT(*) as c FROM send_log WHERE sent_at::date = CURRENT_DATE`)[0] as { c: string | number })?.c ?? 0);
+  const sentTotal = Number(((await sql`SELECT COUNT(*) as c FROM send_log WHERE result = 'ok'`)[0] as { c: string | number })?.c ?? 0);
+  const replies = Number(((await sql`SELECT COUNT(*) as c FROM leads WHERE status = 'replied'`)[0] as { c: string | number })?.c ?? 0);
+  const approved = Number(((await sql`SELECT COUNT(*) as c FROM emails WHERE status = 'approved' AND sequence_day = 1`)[0] as { c: string | number })?.c ?? 0);
+  const sourceCounts = await sql`SELECT source, COUNT(*) as count FROM leads GROUP BY source ORDER BY count DESC` as { source: string; count: string | number }[];
+  const bySources = Object.fromEntries(sourceCounts.map(r => [r.source, Number(r.count)]));
   return { byStatus, sentToday, sentTotal, replies, approved, dailyLimit: config.dailySendLimit, bySources };
 }
 
-export function getLeads(status?: string) {
-  const db = getDb();
-  const query = status
-    ? `SELECT l.*, (SELECT domain FROM lead_domain_matches WHERE lead_id = l.id LIMIT 1) as matched_domain FROM leads l WHERE l.status = ? ORDER BY l.score DESC LIMIT 100`
-    : `SELECT l.*, (SELECT domain FROM lead_domain_matches WHERE lead_id = l.id LIMIT 1) as matched_domain FROM leads l ORDER BY l.score DESC LIMIT 100`;
-  return status ? db.prepare(query).all(status) : db.prepare(query).all();
+export async function getLeads(status?: string) {
+  if (status) {
+    return await sql`SELECT l.*, (SELECT domain FROM lead_domain_matches WHERE lead_id = l.id LIMIT 1) as matched_domain FROM leads l WHERE l.status = ${status} ORDER BY l.score DESC LIMIT 100`;
+  }
+  return await sql`SELECT l.*, (SELECT domain FROM lead_domain_matches WHERE lead_id = l.id LIMIT 1) as matched_domain FROM leads l ORDER BY l.score DESC LIMIT 100`;
 }
 
-export function getApprovedEmails() {
-  const db = getDb();
-  return db.prepare(`SELECT e.id, e.domain, e.subject, e.body, e.variant, l.name, l.email, l.score FROM emails e INNER JOIN leads l ON l.id = e.lead_id WHERE e.status = 'approved' AND e.sequence_day = 1 ORDER BY l.score DESC`).all();
+export async function getApprovedEmails() {
+  return await sql`SELECT e.id, e.domain, e.subject, e.body, e.variant, l.name, l.email, l.score FROM emails e INNER JOIN leads l ON l.id = e.lead_id WHERE e.status = 'approved' AND e.sequence_day = 1 ORDER BY l.score DESC`;
 }
 
-export function getDomainAnalyses() {
-  const db = getDb();
-  return db.prepare('SELECT domain, analysis, created_at FROM domain_analyses ORDER BY created_at DESC').all() as { domain: string; analysis: string; created_at: string }[];
+export async function getDomainAnalyses() {
+  return await sql`SELECT domain, analysis, created_at FROM domain_analyses ORDER BY created_at DESC` as { domain: string; analysis: string; created_at: string }[];
 }
 
-export function getSentEmails() {
-  const db = getDb();
-  return db.prepare(`
+export async function getSentEmails() {
+  return await sql`
     SELECT e.id, e.domain, e.subject, e.body, e.variant, e.sent_at, e.sequence_day,
            l.name, l.email, l.score, l.company
     FROM emails e
@@ -1952,7 +1935,7 @@ export function getSentEmails() {
     WHERE e.status = 'sent'
     ORDER BY e.sent_at DESC
     LIMIT 200
-  `).all();
+  `;
 }
 
 interface LeadRow { id: number; name: string; email: string; company: string | null; raw_data: string; enrichment: string; }

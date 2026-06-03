@@ -1,16 +1,16 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { getDb } from '@/lib/db';
+import { sql } from '@/lib/db';
 
 export async function GET(req: NextRequest) {
   const email = req.nextUrl.searchParams.get('email');
   if (!email) return new NextResponse('Missing email', { status: 400 });
 
-  const db = getDb();
-  const lead = db.prepare('SELECT id FROM leads WHERE LOWER(email) = LOWER(?)').get(email) as { id: number } | undefined;
+  const rows = await sql`SELECT id FROM leads WHERE LOWER(email) = LOWER(${email})`;
+  const lead = rows[0] as { id: number } | undefined;
 
   if (lead) {
-    db.prepare(`UPDATE leads SET status = 'unsubscribed' WHERE id = ?`).run(lead.id);
-    db.prepare(`UPDATE emails SET status = 'cancelled' WHERE lead_id = ? AND status = 'approved'`).run(lead.id);
+    await sql`UPDATE leads SET status = 'unsubscribed' WHERE id = ${lead.id}`;
+    await sql`UPDATE emails SET status = 'cancelled' WHERE lead_id = ${lead.id} AND status = 'approved'`;
   }
 
   return new NextResponse(

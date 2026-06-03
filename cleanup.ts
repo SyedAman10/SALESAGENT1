@@ -1,29 +1,30 @@
-import { getDb } from './lib/db';
-
-const db = getDb();
+import { sql } from './lib/db';
 
 const blocklist = ['bank','financial','insurance','automotive','siemens','renault','volkswagen',
   'sligro','food group','pharma','hospital','university','government','ministry',
   'telecom','airline','retail','supermarket','logistics','consulting'];
 
-const leads = db.prepare('SELECT id, company FROM leads').all() as { id: number; company: string | null }[];
+async function main() {
+  const leads = await sql`SELECT id, company FROM leads` as { id: number; company: string | null }[];
 
-let removed = 0;
-for (const lead of leads) {
-  const company = (lead.company ?? '').toLowerCase();
-  if (blocklist.some(t => company.includes(t))) {
-    db.prepare('DELETE FROM emails WHERE lead_id = ?').run(lead.id);
-    db.prepare('DELETE FROM lead_domain_matches WHERE lead_id = ?').run(lead.id);
-    db.prepare('DELETE FROM leads WHERE id = ?').run(lead.id);
-    removed++;
+  let removed = 0;
+  for (const lead of leads) {
+    const company = (lead.company ?? '').toLowerCase();
+    if (blocklist.some(t => company.includes(t))) {
+      await sql`DELETE FROM emails WHERE lead_id = ${lead.id}`;
+      await sql`DELETE FROM lead_domain_matches WHERE lead_id = ${lead.id}`;
+      await sql`DELETE FROM leads WHERE id = ${lead.id}`;
+      removed++;
+    }
   }
+
+  await sql`UPDATE leads SET status = 'enriched' WHERE status = 'no_match'`;
+  await sql`DELETE FROM lead_domain_matches WHERE lead_id IN (SELECT id FROM leads WHERE status = 'enriched')`;
+  await sql`DELETE FROM emails WHERE lead_id IN (SELECT id FROM leads WHERE status = 'enriched') AND sequence_day = 1`;
+
+  const countRows = await sql`SELECT COUNT(*) as c FROM leads`;
+  console.log(`Removed ${removed} corporate non-domain leads`);
+  console.log(`Remaining leads: ${(countRows[0] as { c: string | number }).c}`);
 }
 
-// Reset no_match leads so they get re-matched with the improved prompt
-const reset = db.prepare(`UPDATE leads SET status = 'enriched' WHERE status = 'no_match'`).run();
-db.prepare(`DELETE FROM lead_domain_matches WHERE lead_id IN (SELECT id FROM leads WHERE status = 'enriched')`).run();
-db.prepare(`DELETE FROM emails WHERE lead_id IN (SELECT id FROM leads WHERE status = 'enriched') AND sequence_day = 1`).run();
-
-console.log(`Removed ${removed} corporate non-domain leads`);
-console.log(`Reset ${reset.changes} no_match leads for re-matching`);
-console.log(`Remaining leads: ${(db.prepare('SELECT COUNT(*) as c FROM leads').get() as { c: number }).c}`);
+main().catch(console.error);

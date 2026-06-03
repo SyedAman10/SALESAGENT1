@@ -1,19 +1,18 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { getLeads } from '@/lib/pipeline';
-import { getDb } from '@/lib/db';
+import { sql } from '@/lib/db';
 
 export async function GET(req: NextRequest) {
   const status = req.nextUrl.searchParams.get('status') ?? undefined;
-  const leads = getLeads(status);
+  const leads = await getLeads(status);
   return NextResponse.json(leads);
 }
 
 export async function PATCH(req: NextRequest) {
   const { id, status } = await req.json() as { id: number; status: string };
-  const db = getDb();
-  db.prepare('UPDATE leads SET status = ? WHERE id = ?').run(status, id);
+  await sql`UPDATE leads SET status = ${status} WHERE id = ${id}`;
   if (status === 'unsubscribed') {
-    db.prepare(`UPDATE emails SET status = 'cancelled' WHERE lead_id = ? AND status = 'approved'`).run(id);
+    await sql`UPDATE emails SET status = 'cancelled' WHERE lead_id = ${id} AND status = 'approved'`;
   }
   return NextResponse.json({ ok: true });
 }

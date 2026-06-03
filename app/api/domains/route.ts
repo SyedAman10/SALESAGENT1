@@ -3,7 +3,7 @@ import { getPortfolio, getDomainAnalyses } from '@/lib/pipeline';
 
 export async function GET() {
   const portfolio = getPortfolio();
-  const analyses = getDomainAnalyses();
+  const analyses = await getDomainAnalyses();
   const analysisMap = new Map(analyses.map(a => [a.domain, a.analysis]));
 
   return NextResponse.json(
