@@ -52,7 +52,7 @@ interface Email {
   company?: string;
 }
 
-type PipelineStep = 'analyze' | 'ingest' | 'enrich' | 'match' | 'write' | 'decide' | 'sequence' | 'test' | 'hot';
+type PipelineStep = 'analyze' | 'ingest' | 'enrich' | 'match' | 'write' | 'decide' | 'sequence' | 'test' | 'hot' | 'testnew';
 
 const STEPS: { key: PipelineStep; label: string; desc: string }[] = [
   { key: 'analyze', label: '0. Analyze', desc: 'Study domain portfolio' },
@@ -124,7 +124,7 @@ export default function Dashboard() {
     fetchPortfolio();
   }, [fetchStats, fetchLeads, fetchEmails, fetchSentEmails, fetchPortfolio]);
 
-  const DOMAIN_PICKER_STEPS = new Set<PipelineStep | 'all'>(['analyze', 'ingest', 'match', 'all', 'test', 'hot']);
+  const DOMAIN_PICKER_STEPS = new Set<PipelineStep | 'all'>(['analyze', 'ingest', 'match', 'all', 'test', 'hot', 'testnew']);
 
   function openDomainPicker(action: PipelineStep | 'all') {
     setPickerSelected(portfolio.map(d => d.domain));
@@ -284,6 +284,18 @@ export default function Dashboard() {
               </div>
             </div>
             {running === 'hot' && <span className="text-red-300 text-xs animate-pulse ml-1">running</span>}
+          </button>
+
+          <button onClick={() => openDomainPicker('testnew')} disabled={!!running || sending}
+            className="px-3 py-2.5 rounded border border-cyan-700 hover:border-cyan-500 hover:bg-cyan-900/30 disabled:opacity-40 text-cyan-400 text-xs font-medium transition-colors">
+            <div className="flex items-center gap-2">
+              <span>🧪</span>
+              <div className="text-left">
+                <p>Test NameBio + Industry</p>
+                <p className="text-cyan-600 font-normal text-xs">NameBio recent sales · Apollo org-keywords</p>
+              </div>
+            </div>
+            {running === 'testnew' && <span className="text-cyan-300 text-xs animate-pulse ml-1">running</span>}
           </button>
 
           <button onClick={() => openDomainPicker('test')} disabled={!!running || sending}

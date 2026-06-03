@@ -1216,6 +1216,55 @@ async function scrapeRedditJSON(kwSet: Set<string>): Promise<{ leads: RawLead[];
 // All discovered domain names → Apollo org domain lookup → founder/CEO emails
 // Fallback: Apollo direct people search based on domain analysis
 
+export async function testNewSources(targetDomains?: string[]): Promise<{ inserted: number; skipped: number; breakdown: Record<string, number>; errors: Record<string, string> }> {
+  const portfolio = loadPortfolio(targetDomains);
+  const allLeads: RawLead[] = [];
+  const seen = new Set<string>();
+  const breakdown: Record<string, number> = {};
+  const errors: Record<string, string> = {};
+
+  for (const asset of portfolio) {
+    const analysis = await getDomainAnalysis(asset.domain);
+
+    // NameBio
+    try {
+      const namebioLeads = await scrapeNameBio(asset);
+      for (const l of namebioLeads) {
+        if (l.email && l.source && !seen.has(l.email)) { seen.add(l.email); allLeads.push(l); breakdown[l.source] = (breakdown[l.source] ?? 0) + 1; }
+      }
+    } catch (e) { errors[`namebio:${asset.domain}`] = (e as Error).message; }
+
+    if (!analysis) { errors[`apollo-industry:${asset.domain}`] = 'no analysis — run Analyze first'; continue; }
+
+    // Apollo industry org-keyword search
+    for (const industry of analysis.industries.slice(0, 3)) {
+      try {
+        const res = await axios.post(
+          'https://api.apollo.io/api/v1/mixed_people/api_search',
+          { q_organization_keywords: industry, person_seniority: ['owner', 'founder', 'c_suite'], organization_num_employees_ranges: ['1,10', '11,50', '51,200'], per_page: 20, page: 1 },
+          { headers: { 'Content-Type': 'application/json', 'X-Api-Key': config.apolloApiKey } }
+        );
+        const people: ApolloPersonResult[] = res.data?.people ?? [];
+        const withEmail = people.filter(p => p.email?.includes('@'));
+        const toReveal = people.filter(p => p.has_email && !p.email).slice(0, 8);
+        const revealed = toReveal.length ? await revealEmails(toReveal) : [];
+        for (const p of [...withEmail, ...revealed].filter(p => p.email)) {
+          if (!seen.has(p.email!)) {
+            seen.add(p.email!);
+            const src = `apollo:${asset.domain}-industry`;
+            breakdown[src] = (breakdown[src] ?? 0) + 1;
+            allLeads.push({ name: [p.first_name, p.last_name].filter(Boolean).join(' '), email: p.email!, company: p.organization?.name, linkedin_url: p.linkedin_url, source: src, raw_data: { industry, title: p.title } });
+          }
+        }
+      } catch (e) { errors[`apollo-industry:${industry}`] = (e as Error).message; }
+      await sleep(400);
+    }
+  }
+
+  const { inserted, skipped } = await upsertLeads(allLeads);
+  return { inserted, skipped, breakdown, errors };
+}
+
 export async function testApifyApollo(targetDomains?: string[]): Promise<{ inserted: number; skipped: number; sources: Record<string, number>; breakdown: Record<string, number>; errors: Record<string, string> }> {
   const portfolio = loadPortfolio(targetDomains);
   const allLeads: RawLead[] = [];

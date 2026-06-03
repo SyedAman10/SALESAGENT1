@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { ingestLeads, enrichLeads, matchDomains, writeEmails, decideAndApprove, analyzeDomains, writeFollowUps, testApifyApollo, findHotLeads } from '@/lib/pipeline';
+import { ingestLeads, enrichLeads, matchDomains, writeEmails, decideAndApprove, analyzeDomains, writeFollowUps, testApifyApollo, findHotLeads, testNewSources } from '@/lib/pipeline';
 
 export const maxDuration = 300;
 
@@ -48,6 +48,10 @@ export async function POST(req: NextRequest) {
           ...result.sources,
           ...(hasErrors ? { errors: result.errors } : {}),
         });
+      }
+      case 'testnew': {
+        const result = await testNewSources(domains);
+        return NextResponse.json({ ok: true, inserted: result.inserted, skipped: result.skipped, ...result.breakdown, ...(Object.keys(result.errors).length ? { errors: result.errors } : {}) });
       }
       case 'test': {
         const result = await testApifyApollo(domains);
