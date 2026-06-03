@@ -1,65 +1,671 @@
-import Image from "next/image";
+'use client';
 
-export default function Home() {
+import { useState, useEffect, useCallback } from 'react';
+
+interface Stats {
+  byStatus: Record<string, number>;
+  sentToday: number;
+  sentTotal: number;
+  replies: number;
+  approved: number;
+  dailyLimit: number;
+  bySources: Record<string, number>;
+}
+
+interface Lead {
+  id: number;
+  name: string;
+  email: string;
+  company: string | null;
+  score: number | null;
+  status: string;
+  source: string;
+  linkedin_url: string | null;
+  enrichment: string | null;
+  matched_domain: string | null;
+  created_at: string;
+}
+
+interface PortfolioDomain {
+  domain: string;
+  category: string;
+  asking_price: number;
+  description: string;
+  analysis: {
+    ideal_buyer_types: string[]; industries: string[]; use_cases: string[];
+    value_props: string[]; comparable_sales: string[]; email_hooks: string[];
+    buyer_profile_summary: string; one_liner: string;
+  } | null;
+}
+
+interface Email {
+  id: number;
+  name: string;
+  email: string;
+  score: number;
+  domain: string;
+  subject: string;
+  body: string;
+  variant: string;
+  sent_at?: string;
+  sequence_day?: number;
+  company?: string;
+}
+
+type PipelineStep = 'analyze' | 'ingest' | 'enrich' | 'match' | 'write' | 'decide' | 'sequence' | 'test' | 'hot';
+
+const STEPS: { key: PipelineStep; label: string; desc: string }[] = [
+  { key: 'analyze', label: '0. Analyze', desc: 'Study domain portfolio' },
+  { key: 'ingest', label: '1. Ingest', desc: 'Domain-specific + broker leads' },
+  { key: 'enrich', label: '2. Enrich', desc: 'Score leads with Claude' },
+  { key: 'match', label: '3. Match', desc: 'Match domains to leads' },
+  { key: 'write', label: '4. Write', desc: 'Write email variants' },
+  { key: 'decide', label: '5. Decide', desc: 'Pick best variant' },
+  { key: 'sequence', label: '6. Sequence', desc: 'Write Day 3/5/7 follow-ups' },
+];
+
+const STATUS_COLORS: Record<string, string> = {
+  new: 'bg-gray-500',
+  enriched: 'bg-blue-500',
+  contacted: 'bg-purple-500',
+  replied: 'bg-green-500',
+  skipped: 'bg-yellow-600',
+  no_match: 'bg-red-600',
+  unsubscribed: 'bg-red-900',
+};
+
+export default function Dashboard() {
+  const [stats, setStats] = useState<Stats | null>(null);
+  const [leads, setLeads] = useState<Lead[]>([]);
+  const [emails, setEmails] = useState<Email[]>([]);
+  const [activeTab, setActiveTab] = useState<'overview' | 'leads' | 'emails' | 'sent' | 'analysis'>('overview');
+  const [running, setRunning] = useState<string | null>(null);
+  const [log, setLog] = useState<string[]>([]);
+  const [selectedEmail, setSelectedEmail] = useState<Email | null>(null);
+  const [sending, setSending] = useState(false);
+  const [showPreview, setShowPreview] = useState(false);
+  const [sentEmails, setSentEmails] = useState<Email[]>([]);
+  const [portfolio, setPortfolio] = useState<PortfolioDomain[]>([]);
+  const [showDomainPicker, setShowDomainPicker] = useState(false);
+  const [pickerSelected, setPickerSelected] = useState<string[]>([]);
+  const [pendingAction, setPendingAction] = useState<PipelineStep | 'all' | null>(null);
+
+  const fetchStats = useCallback(async () => {
+    const res = await fetch('/api/stats');
+    setStats(await res.json());
+  }, []);
+
+  const fetchLeads = useCallback(async () => {
+    const res = await fetch('/api/leads');
+    setLeads(await res.json());
+  }, []);
+
+  const fetchEmails = useCallback(async () => {
+    const res = await fetch('/api/emails');
+    setEmails(await res.json());
+  }, []);
+
+  const fetchSentEmails = useCallback(async () => {
+    const res = await fetch('/api/emails?status=sent');
+    setSentEmails(await res.json());
+  }, []);
+
+  const fetchPortfolio = useCallback(async () => {
+    const res = await fetch('/api/domains');
+    const data: PortfolioDomain[] = await res.json();
+    setPortfolio(data);
+  }, []);
+
+  useEffect(() => {
+    fetchStats();
+    fetchLeads();
+    fetchEmails();
+    fetchSentEmails();
+    fetchPortfolio();
+  }, [fetchStats, fetchLeads, fetchEmails, fetchSentEmails, fetchPortfolio]);
+
+  const DOMAIN_PICKER_STEPS = new Set<PipelineStep | 'all'>(['analyze', 'ingest', 'match', 'all', 'test', 'hot']);
+
+  function openDomainPicker(action: PipelineStep | 'all') {
+    setPickerSelected(portfolio.map(d => d.domain));
+    setPendingAction(action);
+    setShowDomainPicker(true);
+  }
+
+  async function runStep(step: PipelineStep, domains?: string[]) {
+    setRunning(step);
+    setLog(prev => [...prev, `▶ Running ${step}${domains ? ` [${domains.join(', ')}]` : ''}...`]);
+    try {
+      const res = await fetch('/api/pipeline', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ step, domains }),
+      });
+      const data = await res.json();
+      if (data.ok) {
+        const summary = Object.entries(data)
+          .filter(([k]) => k !== 'ok' && k !== 'errors')
+          .map(([k, v]) => `${k}: ${v}`)
+          .join(' | ');
+        setLog(prev => [...prev, `✓ ${step} done — ${summary}`]);
+        if (data.errors && Object.keys(data.errors as object).length > 0) {
+          for (const [src, msg] of Object.entries(data.errors as Record<string, string>)) {
+            setLog(prev => [...prev, `  ⚠ ${src}: ${msg}`]);
+          }
+        }
+      } else {
+        setLog(prev => [...prev, `✗ ${step} failed — ${data.error}`]);
+      }
+    } catch (e) {
+      setLog(prev => [...prev, `✗ ${step} error — ${(e as Error).message}`]);
+    }
+    setRunning(null);
+    fetchStats();
+    fetchLeads();
+    fetchEmails();
+    if (step === 'analyze') fetchPortfolio();
+  }
+
+  async function runAll(domains?: string[]) {
+    for (const step of STEPS) {
+      await runStep(step.key, ['analyze', 'match'].includes(step.key) ? domains : undefined);
+    }
+  }
+
+  async function confirmDomainPicker() {
+    const action = pendingAction;
+    const domains = pickerSelected;
+    setShowDomainPicker(false);
+    setPendingAction(null);
+    if (!action) return;
+    if (action === 'all') {
+      await runAll(domains);
+    } else {
+      await runStep(action, domains);
+    }
+  }
+
+  async function confirmAndSend() {
+    setShowPreview(true);
+  }
+
+  async function sendEmails() {
+    setShowPreview(false);
+    setSending(true);
+    setLog(prev => [...prev, '▶ Sending approved emails...']);
+    try {
+      const res = await fetch('/api/send', { method: 'POST' });
+      if (!res.body) throw new Error('No stream');
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        const text = decoder.decode(value);
+        for (const line of text.split('\n')) {
+          if (!line.startsWith('data: ')) continue;
+          try {
+            const event = JSON.parse(line.slice(6)) as { type: string; message: string };
+            if (event.type === 'done') break;
+            setLog(prev => [...prev, event.message]);
+            if (event.type === 'sent' || event.type === 'failed') {
+              fetchStats();
+              fetchLeads();
+            }
+          } catch { /* skip malformed */ }
+        }
+      }
+    } catch (e) {
+      setLog(prev => [...prev, `✗ Send error — ${(e as Error).message}`]);
+    }
+    setSending(false);
+    fetchStats();
+    fetchLeads();
+    fetchSentEmails();
+    fetchEmails();
+  }
+
+  async function markReplied(id: number) {
+    await fetch('/api/leads', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id, status: 'replied' }),
+    });
+    fetchLeads();
+    fetchStats();
+  }
+
+  const total = stats ? Object.values(stats.byStatus).reduce((a, b) => a + b, 0) : 0;
+
   return (
-    <div className="flex flex-col flex-1 items-center justify-center bg-zinc-50 font-sans dark:bg-black">
-      <main className="flex flex-1 w-full max-w-3xl flex-col items-center justify-between py-32 px-16 bg-white dark:bg-black sm:items-start">
-        <Image
-          className="dark:invert"
-          src="/next.svg"
-          alt="Next.js logo"
-          width={100}
-          height={20}
-          priority
-        />
-        <div className="flex flex-col items-center gap-6 text-center sm:items-start sm:text-left">
-          <h1 className="max-w-xs text-3xl font-semibold leading-10 tracking-tight text-black dark:text-zinc-50">
-            To get started, edit the page.tsx file.
-          </h1>
-          <p className="max-w-md text-lg leading-8 text-zinc-600 dark:text-zinc-400">
-            Looking for a starting point or more instructions? Head over to{" "}
-            <a
-              href="https://vercel.com/templates?framework=next.js&utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-              className="font-medium text-zinc-950 dark:text-zinc-50"
-            >
-              Templates
-            </a>{" "}
-            or the{" "}
-            <a
-              href="https://nextjs.org/learn?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-              className="font-medium text-zinc-950 dark:text-zinc-50"
-            >
-              Learning
-            </a>{" "}
-            center.
-          </p>
+    <div className="min-h-screen bg-gray-950 text-gray-100 font-mono text-sm">
+      {/* Header */}
+      <div className="border-b border-gray-800 px-6 py-4 flex items-center justify-between">
+        <div>
+          <h1 className="text-white font-semibold text-base">Domain Sales Agent</h1>
+          <p className="text-gray-500 text-xs mt-0.5">indikaclub.com · $3,900</p>
         </div>
-        <div className="flex flex-col gap-4 text-base font-medium sm:flex-row">
-          <a
-            className="flex h-12 w-full items-center justify-center gap-2 rounded-full bg-foreground px-5 text-background transition-colors hover:bg-[#383838] dark:hover:bg-[#ccc] md:w-[158px]"
-            href="https://vercel.com/new?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            <Image
-              className="dark:invert"
-              src="/vercel.svg"
-              alt="Vercel logomark"
-              width={16}
-              height={16}
-            />
-            Deploy Now
-          </a>
-          <a
-            className="flex h-12 w-full items-center justify-center rounded-full border border-solid border-black/[.08] px-5 transition-colors hover:border-transparent hover:bg-black/[.04] dark:border-white/[.145] dark:hover:bg-[#1a1a1a] md:w-[158px]"
-            href="https://nextjs.org/docs?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            Documentation
-          </a>
+        <div className="flex gap-2">
+          {(['overview', 'leads', 'emails', 'sent', 'analysis'] as const).map(tab => (
+            <button key={tab} onClick={() => { setActiveTab(tab); if (tab === 'sent') fetchSentEmails(); if (tab === 'analysis') fetchPortfolio(); }}
+              className={`px-3 py-1.5 rounded text-xs capitalize ${activeTab === tab ? 'bg-gray-700 text-white' : 'text-gray-400 hover:text-white'}`}>
+              {tab === 'overview' ? 'Overview' : tab === 'leads' ? `Leads (${total})` : tab === 'emails' ? `Approved (${emails.length})` : tab === 'sent' ? `Sent (${sentEmails.length})` : `Domains (${portfolio.length})`}
+            </button>
+          ))}
         </div>
-      </main>
+      </div>
+
+      <div className="flex h-[calc(100vh-57px)]">
+        {/* Sidebar */}
+        <div className="w-64 border-r border-gray-800 p-4 flex flex-col gap-3 overflow-auto">
+          <p className="text-gray-500 text-xs uppercase tracking-wider mb-1">Pipeline</p>
+
+          {STEPS.map(step => (
+            <button key={step.key}
+              onClick={() => DOMAIN_PICKER_STEPS.has(step.key) ? openDomainPicker(step.key) : runStep(step.key)}
+              disabled={!!running || sending}
+              className="text-left px-3 py-2.5 rounded border border-gray-700 hover:border-gray-500 hover:bg-gray-800 disabled:opacity-40 transition-colors">
+              <div className="flex items-center justify-between">
+                <span className="text-white text-xs">{step.label}</span>
+                {running === step.key && <span className="text-blue-400 text-xs animate-pulse">running</span>}
+              </div>
+              <p className="text-gray-500 text-xs mt-0.5">{step.desc}</p>
+            </button>
+          ))}
+
+          <button onClick={() => openDomainPicker('hot')} disabled={!!running || sending}
+            className="px-3 py-2.5 rounded border border-red-700 hover:border-red-500 hover:bg-red-900/30 disabled:opacity-40 text-red-400 text-xs font-medium transition-colors">
+            <div className="flex items-center gap-2">
+              <span>🔥</span>
+              <div className="text-left">
+                <p>Hot Leads</p>
+                <p className="text-red-600 font-normal text-xs">Domain brokers · Investors · Advisors</p>
+              </div>
+            </div>
+            {running === 'hot' && <span className="text-red-300 text-xs animate-pulse ml-1">running</span>}
+          </button>
+
+          <button onClick={() => openDomainPicker('test')} disabled={!!running || sending}
+            className="px-3 py-2.5 rounded border border-amber-700 hover:border-amber-500 hover:bg-amber-900/30 disabled:opacity-40 text-amber-400 text-xs font-medium transition-colors">
+            <div className="flex items-center gap-2">
+              <span>⚡</span>
+              <div className="text-left">
+                <p>Test Auctions + Apollo</p>
+                <p className="text-amber-600 font-normal text-xs">Sedo · Afternic · ExpiredDomains → Apollo</p>
+              </div>
+            </div>
+            {running === 'test' && <span className="text-amber-300 text-xs animate-pulse ml-1">running</span>}
+          </button>
+
+          <button onClick={() => openDomainPicker('all')} disabled={!!running || sending}
+            className="px-3 py-2.5 rounded bg-blue-600 hover:bg-blue-500 disabled:opacity-40 text-white text-xs font-medium transition-colors">
+            ▶ Run All Steps
+          </button>
+
+          <div className="border-t border-gray-800 pt-3 mt-1">
+            <button onClick={confirmAndSend} disabled={!!running || sending || (stats?.approved ?? 0) === 0}
+              className="w-full px-3 py-2.5 rounded bg-green-700 hover:bg-green-600 disabled:opacity-40 text-white text-xs font-medium transition-colors">
+              {sending ? 'Sending...' : `Send ${stats?.approved ?? 0} Approved Email${(stats?.approved ?? 0) !== 1 ? 's' : ''}`}
+            </button>
+            <p className="text-gray-600 text-xs mt-1.5 text-center">{stats?.sentToday ?? 0} / {stats?.dailyLimit ?? 50} sent today</p>
+            <p className="text-gray-700 text-xs mt-1 text-center">⏱ auto-runs daily 9am UTC</p>
+          </div>
+
+          {log.length > 0 && (
+            <div className="border-t border-gray-800 pt-3 mt-1">
+              <p className="text-gray-500 text-xs uppercase tracking-wider mb-2">Log</p>
+              <div className="space-y-1 max-h-48 overflow-y-auto">
+                {log.slice(-10).map((line, i) => (
+                  <p key={i} className={`text-xs break-all ${line.startsWith('✓') ? 'text-green-400' : line.startsWith('✗') ? 'text-red-400' : 'text-gray-400'}`}>{line}</p>
+                ))}
+              </div>
+            </div>
+          )}
+        </div>
+
+        {/* Main */}
+        <div className="flex-1 overflow-auto p-6">
+          {activeTab === 'overview' && stats && (
+            <div className="space-y-6">
+              <div className="grid grid-cols-4 gap-4">
+                {[
+                  { label: 'Total Leads', value: total },
+                  { label: 'Sent Total', value: stats.sentTotal },
+                  { label: 'Replies', value: stats.replies },
+                  { label: 'Reply Rate', value: stats.sentTotal > 0 ? `${((stats.replies / stats.sentTotal) * 100).toFixed(1)}%` : '—' },
+                ].map(card => (
+                  <div key={card.label} className="bg-gray-900 border border-gray-800 rounded-lg p-4">
+                    <p className="text-gray-500 text-xs">{card.label}</p>
+                    <p className="text-white text-2xl font-semibold mt-1">{card.value}</p>
+                  </div>
+                ))}
+              </div>
+
+              <div className="bg-gray-900 border border-gray-800 rounded-lg p-4">
+                <p className="text-gray-400 text-xs uppercase tracking-wider mb-4">Lead Pipeline</p>
+                <div className="space-y-3">
+                  {Object.entries(stats.byStatus).map(([status, count]) => (
+                    <div key={status} className="flex items-center gap-3">
+                      <span className={`w-2 h-2 rounded-full flex-shrink-0 ${STATUS_COLORS[status] ?? 'bg-gray-600'}`} />
+                      <span className="text-gray-400 w-28 capitalize">{status.replace('_', ' ')}</span>
+                      <div className="flex-1 bg-gray-800 rounded-full h-1.5">
+                        <div className={`h-1.5 rounded-full ${STATUS_COLORS[status] ?? 'bg-gray-600'}`}
+                          style={{ width: total > 0 ? `${(count / total) * 100}%` : '0%' }} />
+                      </div>
+                      <span className="text-white w-8 text-right">{count}</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+
+              {stats && Object.keys(stats.bySources).length > 0 && (
+                <div className="bg-gray-900 border border-gray-800 rounded-lg p-4">
+                  <p className="text-gray-400 text-xs uppercase tracking-wider mb-4">Lead Sources</p>
+                  <div className="space-y-2">
+                    {Object.entries(stats.bySources).sort((a, b) => b[1] - a[1]).map(([source, count]) => {
+                      const label = source.startsWith('apollo:') && source.endsWith('-buyer')
+                        ? `🎯 ${source.replace('apollo:', '').replace('-buyer', '')} (targeted)`
+                        : source === 'namepros:wanted' ? '🔥 Namepros wanted (high intent)'
+                        : source === 'namepros:direct' ? '📋 Namepros direct'
+                        : source === 'dnforum:direct' ? '📋 DNForum direct'
+                        : source === 'apify:namepros' ? '🤖 Apify Namepros'
+                        : source.startsWith('godaddy:') ? '🏪 GoDaddy Auctions'
+                        : source.startsWith('afternic:') ? '🏪 Afternic/Sedo'
+                        : source.startsWith('apollo:') ? `💼 Apollo (${source.replace('apollo:', '')})`
+                        : source;
+                      return (
+                        <div key={source} className="flex items-center gap-3">
+                          <span className="text-gray-300 text-xs flex-1 truncate">{label}</span>
+                          <div className="w-24 bg-gray-800 rounded-full h-1.5 flex-shrink-0">
+                            <div className="h-1.5 rounded-full bg-blue-500" style={{ width: `${Math.min((count / Math.max(...Object.values(stats.bySources))) * 100, 100)}%` }} />
+                          </div>
+                          <span className="text-white text-xs w-6 text-right flex-shrink-0">{count}</span>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              )}
+
+              {total === 0 && (
+                <div className="bg-gray-900 border border-gray-700 rounded-lg p-5">
+                  <p className="text-gray-300 text-xs font-medium mb-3">Quick Start</p>
+                  <ol className="text-gray-500 text-xs space-y-2 list-decimal list-inside">
+                    <li>Run <span className="text-white">0. Analyze</span> first — unlocks domain-specific lead targeting</li>
+                    <li>Click <span className="text-white">Run All Steps</span> — finds brokers + end-user buyers per domain, enriches, matches, writes, decides</li>
+                    <li>Review emails in <span className="text-white">Approved</span> tab, then click <span className="text-white">Send</span></li>
+                    <li>After sending, run <span className="text-white">6. Sequence</span> daily — writes Day 3/5/7 follow-ups automatically</li>
+                    <li>Each daily send picks up any due follow-ups alongside new Day 1 emails</li>
+                  </ol>
+                </div>
+              )}
+            </div>
+          )}
+
+          {activeTab === 'leads' && (
+            <div>
+              <div className="flex gap-2 mb-4 flex-wrap">
+                {['all', 'new', 'enriched', 'contacted', 'replied', 'skipped', 'unsubscribed'].map(s => (
+                  <button key={s} onClick={async () => {
+                    const res = await fetch(s === 'all' ? '/api/leads' : `/api/leads?status=${s}`);
+                    setLeads(await res.json());
+                  }} className="px-2.5 py-1 rounded border border-gray-700 hover:border-gray-500 text-gray-400 hover:text-white text-xs capitalize transition-colors">
+                    {s}
+                  </button>
+                ))}
+              </div>
+              <div className="space-y-2">
+                {leads.map(lead => {
+                  const enrichment = lead.enrichment ? (() => { try { return JSON.parse(lead.enrichment!) as { score?: number; reasoning?: string; fit?: string }; } catch { return null; } })() : null;
+                  const scoreColor = (lead.score ?? 0) >= 75 ? 'text-green-400' : (lead.score ?? 0) >= 50 ? 'text-yellow-400' : 'text-gray-500';
+                  const sourceLabel = lead.source?.startsWith('apollo:') ? `Apollo · ${lead.source.replace('apollo:', '')}` : lead.source ?? 'unknown';
+                  return (
+                    <div key={lead.id} className="bg-gray-900 border border-gray-800 rounded-lg px-4 py-3 space-y-2">
+                      <div className="flex items-start justify-between gap-4">
+                        <div className="flex items-start gap-3 min-w-0">
+                          <span className={`w-2 h-2 rounded-full flex-shrink-0 mt-1 ${STATUS_COLORS[lead.status] ?? 'bg-gray-600'}`} />
+                          <div className="min-w-0">
+                            <div className="flex items-center gap-2 flex-wrap">
+                              <p className="text-white text-xs font-medium">{lead.name}</p>
+                              {lead.company && <span className="text-gray-400 text-xs">@ {lead.company}</span>}
+                              {lead.linkedin_url && (
+                                <a href={lead.linkedin_url} target="_blank" rel="noopener noreferrer"
+                                  className="text-blue-500 hover:text-blue-400 text-xs">LinkedIn ↗</a>
+                              )}
+                            </div>
+                            <p className="text-gray-500 text-xs mt-0.5">{lead.email}</p>
+                            <div className="flex items-center gap-2 mt-1 flex-wrap">
+                              <span className="text-gray-600 text-xs">{sourceLabel}</span>
+                              {lead.matched_domain && <><span className="text-gray-700">·</span><span className="text-blue-400 text-xs">{lead.matched_domain}</span></>}
+                              <span className="text-gray-700">·</span>
+                              <span className="text-gray-600 text-xs">{new Date(lead.created_at).toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}</span>
+                            </div>
+                          </div>
+                        </div>
+                        <div className="flex items-center gap-2 flex-shrink-0">
+                          {lead.score != null && (
+                            <span className={`text-xs font-semibold tabular-nums ${scoreColor}`}>{lead.score}</span>
+                          )}
+                          <span className="text-xs px-2 py-0.5 rounded bg-gray-800 text-gray-400 capitalize">{lead.status.replace('_', ' ')}</span>
+                          {lead.status === 'contacted' && (
+                            <button onClick={() => markReplied(lead.id)}
+                              className="text-green-400 hover:text-green-300 text-xs px-2 py-0.5 border border-green-800 rounded hover:border-green-600 transition-colors">
+                              replied
+                            </button>
+                          )}
+                          {lead.status !== 'unsubscribed' && (
+                            <button onClick={async () => {
+                              await fetch('/api/leads', { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id: lead.id, status: 'unsubscribed' }) });
+                              fetchLeads(); fetchStats();
+                            }} className="text-red-600 hover:text-red-400 text-xs px-2 py-0.5 border border-red-900 rounded hover:border-red-700 transition-colors">
+                              ✕
+                            </button>
+                          )}
+                        </div>
+                      </div>
+                      {enrichment?.reasoning && (
+                        <p className="text-gray-600 text-xs leading-relaxed pl-5 border-l border-gray-800">{enrichment.reasoning}</p>
+                      )}
+                    </div>
+                  );
+                })}
+                {leads.length === 0 && <p className="text-gray-600 text-xs text-center py-12">No leads yet — run the pipeline.</p>}
+              </div>
+            </div>
+          )}
+
+          {activeTab === 'sent' && (
+            <div>
+              <p className="text-gray-500 text-xs mb-4">{sentEmails.length} emails sent total</p>
+              <div className="space-y-2">
+                {sentEmails.map(email => (
+                  <div key={email.id} onClick={() => setSelectedEmail(selectedEmail?.id === email.id ? null : email)}
+                    className={`bg-gray-900 border rounded-lg px-4 py-3 cursor-pointer transition-colors ${selectedEmail?.id === email.id ? 'border-purple-500' : 'border-gray-800 hover:border-gray-600'}`}>
+                    <div className="flex items-center justify-between gap-4">
+                      <div className="min-w-0">
+                        <p className="text-white text-xs font-medium truncate">{email.name} <span className="text-gray-500 font-normal">&lt;{email.email}&gt;</span></p>
+                        <p className="text-gray-400 text-xs truncate mt-0.5">{email.subject}</p>
+                      </div>
+                      <div className="flex items-center gap-3 flex-shrink-0 text-xs text-gray-500">
+                        <span className="text-blue-400">{email.domain}</span>
+                        <span>Day {email.sequence_day ?? 1}</span>
+                        <span>{email.sent_at ? new Date(email.sent_at + 'Z').toLocaleDateString('en-US', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }) : '—'}</span>
+                      </div>
+                    </div>
+                    {selectedEmail?.id === email.id && (
+                      <pre className="text-gray-300 text-xs whitespace-pre-wrap leading-relaxed mt-3 pt-3 border-t border-gray-800">{email.body}</pre>
+                    )}
+                  </div>
+                ))}
+                {sentEmails.length === 0 && <p className="text-gray-600 text-xs text-center py-12">No emails sent yet.</p>}
+              </div>
+            </div>
+          )}
+
+          {activeTab === 'analysis' && (
+            <div className="space-y-6">
+              {portfolio.length === 0 && (
+                <p className="text-gray-600 text-xs text-center py-12">No domains found in portfolio.</p>
+              )}
+              {portfolio.map(row => (
+                <div key={row.domain} className="bg-gray-900 border border-gray-800 rounded-lg p-5 space-y-4">
+                  <div className="flex items-start justify-between">
+                    <div>
+                      <h2 className="text-white font-semibold text-sm">{row.domain}</h2>
+                      {row.analysis ? (
+                        <p className="text-blue-400 text-xs mt-1">{row.analysis.one_liner}</p>
+                      ) : (
+                        <p className="text-gray-600 text-xs mt-1">Not analyzed yet — run 0. Analyze</p>
+                      )}
+                    </div>
+                    <div className="text-right flex-shrink-0 ml-4">
+                      <p className="text-white text-sm font-semibold">${row.asking_price.toLocaleString()}</p>
+                      <p className="text-gray-500 text-xs">{row.category}</p>
+                    </div>
+                  </div>
+                  {row.analysis && (
+                    <>
+                      <p className="text-gray-300 text-xs leading-relaxed border-l-2 border-gray-700 pl-3">{row.analysis.buyer_profile_summary}</p>
+                      <div className="grid grid-cols-2 gap-4">
+                        {([
+                          { label: 'Ideal Buyers', items: row.analysis.ideal_buyer_types },
+                          { label: 'Industries', items: row.analysis.industries },
+                          { label: 'Use Cases', items: row.analysis.use_cases },
+                          { label: 'Value Props', items: row.analysis.value_props },
+                          { label: 'Email Hooks', items: row.analysis.email_hooks },
+                          { label: 'Comparable Sales', items: row.analysis.comparable_sales },
+                        ] as { label: string; items: string[] }[]).map(section => (
+                          <div key={section.label}>
+                            <p className="text-gray-500 text-xs uppercase tracking-wider mb-1.5">{section.label}</p>
+                            <ul className="space-y-1">
+                              {section.items.map((item, i) => (
+                                <li key={i} className="text-gray-300 text-xs flex gap-1.5"><span className="text-gray-600 flex-shrink-0">·</span>{item}</li>
+                              ))}
+                            </ul>
+                          </div>
+                        ))}
+                      </div>
+                    </>
+                  )}
+                </div>
+              ))}
+            </div>
+          )}
+
+          {activeTab === 'emails' && (
+            <div className="flex gap-4 h-full">
+              <div className="w-80 space-y-2 overflow-auto flex-shrink-0">
+                {emails.map(email => (
+                  <button key={email.id} onClick={() => setSelectedEmail(email)}
+                    className={`w-full text-left bg-gray-900 border rounded-lg px-3 py-2.5 transition-colors ${selectedEmail?.id === email.id ? 'border-blue-500' : 'border-gray-800 hover:border-gray-600'}`}>
+                    <p className="text-white text-xs font-medium truncate">{email.name}</p>
+                    <p className="text-gray-500 text-xs truncate">{email.subject}</p>
+                    <div className="flex items-center gap-2 mt-1">
+                      <span className="text-blue-400 text-xs">{email.domain}</span>
+                      <span className="text-gray-600 text-xs">·</span>
+                      <span className="text-gray-500 text-xs">{email.variant}</span>
+                      <span className="text-gray-600 text-xs">·</span>
+                      <span className="text-gray-500 text-xs">score {email.score}</span>
+                    </div>
+                  </button>
+                ))}
+                {emails.length === 0 && <p className="text-gray-600 text-xs text-center py-12">No approved emails yet.</p>}
+              </div>
+
+              {selectedEmail ? (
+                <div className="flex-1 bg-gray-900 border border-gray-800 rounded-lg p-5 overflow-auto">
+                  <div className="mb-4 pb-4 border-b border-gray-800 space-y-1">
+                    <p className="text-gray-500 text-xs">To: <span className="text-white">{selectedEmail.name} &lt;{selectedEmail.email}&gt;</span></p>
+                    <p className="text-gray-500 text-xs">Subject: <span className="text-white">{selectedEmail.subject}</span></p>
+                    <p className="text-gray-500 text-xs">Domain: <span className="text-blue-400">{selectedEmail.domain}</span> · Variant: <span className="text-gray-300">{selectedEmail.variant}</span> · Score: <span className="text-gray-300">{selectedEmail.score}</span></p>
+                  </div>
+                  <pre className="text-gray-300 text-xs whitespace-pre-wrap leading-relaxed">{selectedEmail.body}</pre>
+                </div>
+              ) : (
+                <div className="flex-1 flex items-center justify-center text-gray-600 text-xs">Select an email to preview</div>
+              )}
+            </div>
+          )}
+        </div>
+      </div>
+      {/* Domain picker modal */}
+      {showDomainPicker && (
+        <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-6">
+          <div className="bg-gray-900 border border-gray-700 rounded-xl w-full max-w-sm">
+            <div className="px-5 py-4 border-b border-gray-800">
+              <h2 className="text-white text-sm font-medium">Select target domain(s)</h2>
+              <p className="text-gray-500 text-xs mt-0.5">Choose which domains to analyze and match leads against.</p>
+            </div>
+            <div className="p-4 space-y-2">
+              {portfolio.map(d => (
+                <label key={d.domain} className="flex items-center gap-3 px-3 py-2.5 rounded border border-gray-700 hover:border-gray-500 cursor-pointer transition-colors">
+                  <input
+                    type="checkbox"
+                    checked={pickerSelected.includes(d.domain)}
+                    onChange={e => setPickerSelected(prev =>
+                      e.target.checked ? [...prev, d.domain] : prev.filter(x => x !== d.domain)
+                    )}
+                    className="accent-blue-500"
+                  />
+                  <div className="flex-1 min-w-0">
+                    <p className="text-white text-xs font-medium">{d.domain}</p>
+                    <p className="text-gray-500 text-xs">{d.category} · ${d.asking_price.toLocaleString()}</p>
+                  </div>
+                  {d.analysis && <span className="text-green-500 text-xs flex-shrink-0">analyzed</span>}
+                </label>
+              ))}
+            </div>
+            <div className="px-5 py-4 border-t border-gray-800 flex gap-3">
+              <button onClick={confirmDomainPicker} disabled={pickerSelected.length === 0}
+                className="flex-1 py-2.5 rounded bg-blue-600 hover:bg-blue-500 disabled:opacity-40 text-white text-xs font-medium transition-colors">
+                Confirm — {pendingAction === 'all' ? 'Run All Steps' : pendingAction === 'test' ? 'Test Apify+Apollo' : pendingAction}
+              </button>
+              <button onClick={() => { setShowDomainPicker(false); setPendingAction(null); }}
+                className="px-4 py-2.5 rounded border border-gray-700 hover:border-gray-500 text-gray-400 hover:text-white text-xs transition-colors">
+                Cancel
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Preview modal */}
+      {showPreview && (
+        <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-6">
+          <div className="bg-gray-900 border border-gray-700 rounded-xl w-full max-w-2xl max-h-[80vh] flex flex-col">
+            <div className="px-5 py-4 border-b border-gray-800 flex items-center justify-between">
+              <div>
+                <h2 className="text-white text-sm font-medium">Preview — {emails.length} email{emails.length !== 1 ? 's' : ''} will be sent</h2>
+                <p className="text-gray-500 text-xs mt-0.5">Review before sending. Emails go to real inboxes.</p>
+              </div>
+              <button onClick={() => setShowPreview(false)} className="text-gray-500 hover:text-white text-xs">Cancel</button>
+            </div>
+            <div className="overflow-auto flex-1 p-4 space-y-3">
+              {emails.map((email, i) => (
+                <div key={email.id} className="bg-gray-800 rounded-lg p-4 border border-gray-700">
+                  <div className="flex items-center justify-between mb-2">
+                    <p className="text-white text-xs font-medium">{i + 1}. {email.name} <span className="text-gray-400 font-normal">&lt;{email.email}&gt;</span></p>
+                    <span className="text-blue-400 text-xs">{email.domain}</span>
+                  </div>
+                  <p className="text-gray-400 text-xs mb-2">Subject: <span className="text-gray-200">{email.subject}</span></p>
+                  <pre className="text-gray-300 text-xs whitespace-pre-wrap leading-relaxed border-t border-gray-700 pt-2">{email.body}</pre>
+                </div>
+              ))}
+            </div>
+            <div className="px-5 py-4 border-t border-gray-800 flex gap-3">
+              <button onClick={sendEmails}
+                className="flex-1 py-2.5 rounded bg-green-700 hover:bg-green-600 text-white text-xs font-medium transition-colors">
+                Confirm — Send {emails.length} Email{emails.length !== 1 ? 's' : ''}
+              </button>
+              <button onClick={() => setShowPreview(false)}
+                className="px-4 py-2.5 rounded border border-gray-700 hover:border-gray-500 text-gray-400 hover:text-white text-xs transition-colors">
+                Cancel
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
