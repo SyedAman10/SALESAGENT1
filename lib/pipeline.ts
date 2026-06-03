@@ -98,6 +98,7 @@ async function fetchDomainSpecificLeads(asset: Asset, analysis: DomainAnalysis):
   const leads: RawLead[] = [];
   const queries = await generateSearchQueries(asset, analysis);
 
+  // Title-based searches (Claude-generated, end-user buyer profiles)
   for (const query of queries) {
     try {
       const res = await axios.post(
@@ -111,11 +112,9 @@ async function fetchDomainSpecificLeads(asset: Asset, analysis: DomainAnalysis):
         },
         { headers: { 'Content-Type': 'application/json', 'X-Api-Key': config.apolloApiKey } }
       );
-
       const people: ApolloPersonResult[] = res.data?.people ?? [];
       const withEmail = people.filter(p => p.email?.includes('@'));
       const toReveal = people.filter(p => p.has_email && !p.email);
-
       for (const p of withEmail) {
         leads.push({ name: [p.first_name, p.last_name].filter(Boolean).join(' '), email: p.email!, company: p.organization?.name, linkedin_url: p.linkedin_url, source: `apollo:${asset.domain}-buyer`, raw_data: p });
       }
@@ -126,6 +125,33 @@ async function fetchDomainSpecificLeads(asset: Asset, analysis: DomainAnalysis):
     } catch { /* continue */ }
     await sleep(400);
   }
+
+  // Industry org-keyword searches — finds founders at SMBs in target industries
+  // Uses q_organization_keywords (searches company bio/description) + SMB size filter
+  for (const industry of analysis.industries.slice(0, 3)) {
+    try {
+      const res = await axios.post(
+        'https://api.apollo.io/api/v1/mixed_people/api_search',
+        {
+          q_organization_keywords: industry,
+          person_seniority: ['owner', 'founder', 'c_suite'],
+          organization_num_employees_ranges: ['1,10', '11,50', '51,200'],
+          per_page: 20,
+          page: 1,
+        },
+        { headers: { 'Content-Type': 'application/json', 'X-Api-Key': config.apolloApiKey } }
+      );
+      const people: ApolloPersonResult[] = res.data?.people ?? [];
+      const withEmail = people.filter(p => p.email?.includes('@'));
+      const toReveal = people.filter(p => p.has_email && !p.email).slice(0, 8);
+      const revealed = toReveal.length ? await revealEmails(toReveal) : [];
+      for (const p of [...withEmail, ...revealed].filter(p => p.email)) {
+        leads.push({ name: [p.first_name, p.last_name].filter(Boolean).join(' '), email: p.email!, company: p.organization?.name, linkedin_url: p.linkedin_url, source: `apollo:${asset.domain}-industry`, raw_data: { industry, title: p.title, companyDomain: p.organization?.primary_domain } });
+      }
+    } catch { /* continue */ }
+    await sleep(400);
+  }
+
   return leads;
 }
 
@@ -134,10 +160,11 @@ async function fetchDomainSpecificLeads(asset: Asset, analysis: DomainAnalysis):
 // Master coordinator: runs all market sources for a single domain in parallel
 async function scrapeAllMarketSources(asset: Asset, analysis: DomainAnalysis): Promise<RawLead[]> {
   const results = await Promise.allSettled([
-    fetchDomainSpecificLeads(asset, analysis),     // Apollo: targeted end-user buyers
+    fetchDomainSpecificLeads(asset, analysis),     // Apollo: targeted end-user buyers + industry org search
     scrapeNameprosWanted(analysis),                // Namepros "Buy" section: explicit intent
     scrapeGoDaddyAuctions(asset, analysis),        // GoDaddy Auctions: active domain buyers
     scrapeAfternicSedo(asset, analysis),           // Afternic/Sedo: similar domain sellers → Apollo
+    scrapeNameBio(asset),                          // NameBio recent sales → Apollo org lookup (no Apify)
   ]);
   const leads: RawLead[] = [];
   for (const r of results) {
@@ -293,6 +320,59 @@ async function scrapeAfternicSedo(asset: Asset, analysis: DomainAnalysis): Promi
       if (!seen.has(l.email)) { seen.add(l.email); leads.push(l); }
     }
     await sleep(300);
+  }
+  return leads;
+}
+
+// NameBio recent sales → Apollo org-domain lookup
+// Finds founders/owners at companies that recently bought a similar-category domain (proven buyers)
+// Uses direct HTTP scrape — no Apify
+async function scrapeNameBio(asset: Asset): Promise<RawLead[]> {
+  if (!config.apolloApiKey) return [];
+  const leads: RawLead[] = [];
+  const root = asset.domain.split('.')[0]; // "indikaclub"
+  // extract sub-keywords from compound domain: "indikaclub" → ["indika", "club"]
+  const parts = root.match(/[a-z]{3,}/gi) ?? [];
+  const kws = [...new Set([root, ...parts])].slice(0, 2);
+  const seenDomains = new Set<string>();
+
+  for (const kw of kws) {
+    try {
+      const res = await axios.get(`https://namebio.com/?s=${encodeURIComponent(kw)}`, {
+        headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36', Accept: 'text/html,application/xhtml+xml' },
+        timeout: 12000,
+      });
+      const $ = cheerio.load(res.data as string);
+      const soldDomains: string[] = [];
+
+      $('table tr, .nb-results tr, [class*="sale"] tr').each((_, row) => {
+        const cells = $(row).find('td');
+        if (cells.length < 2) return;
+        const txt = $(cells[0]).text().trim().toLowerCase().replace(/\s/g, '');
+        if (/^[a-z0-9][a-z0-9-]{1,40}\.[a-z]{2,6}$/.test(txt) && !seenDomains.has(txt) && !txt.includes('namebio')) {
+          soldDomains.push(txt);
+          seenDomains.add(txt);
+        }
+      });
+
+      if (soldDomains.length === 0) continue;
+
+      // Batch Apollo org-domain lookup — find founders/CEOs at companies using those domains
+      const batch = soldDomains.slice(0, 15);
+      const aRes = await axios.post(
+        'https://api.apollo.io/api/v1/mixed_people/api_search',
+        { organization_domains: batch, person_seniority: ['owner', 'founder', 'c_suite'], per_page: 25, page: 1 },
+        { headers: { 'Content-Type': 'application/json', 'X-Api-Key': config.apolloApiKey } }
+      );
+      const people: ApolloPersonResult[] = aRes.data?.people ?? [];
+      const withEmail = people.filter(p => p.email?.includes('@'));
+      const toReveal = people.filter(p => p.has_email && !p.email).slice(0, 8);
+      const revealed = toReveal.length ? await revealEmails(toReveal) : [];
+      for (const p of [...withEmail, ...revealed].filter(p => p.email)) {
+        leads.push({ name: [p.first_name, p.last_name].filter(Boolean).join(' '), email: p.email!, company: p.organization?.name, linkedin_url: p.linkedin_url, source: `namebio:${kw}`, raw_data: { keyword: kw, targetDomain: asset.domain, companyDomain: p.organization?.primary_domain } });
+      }
+    } catch { /* continue */ }
+    await sleep(700);
   }
   return leads;
 }
