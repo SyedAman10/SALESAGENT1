@@ -7,7 +7,7 @@ export function getSql(): NeonQueryFunction<false, false> {
   return _sql;
 }
 
-export const sql: NeonQueryFunction<false, false> = new Proxy({} as NeonQueryFunction<false, false>, {
+export const sql: NeonQueryFunction<false, false> = new Proxy((() => {}) as unknown as NeonQueryFunction<false, false>, {
   apply(_target, _thisArg, args) {
     return (getSql() as unknown as (...a: unknown[]) => unknown)(...args);
   },
