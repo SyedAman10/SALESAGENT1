@@ -126,30 +126,40 @@ async function fetchDomainSpecificLeads(asset: Asset, analysis: DomainAnalysis):
     await sleep(400);
   }
 
-  // Industry org-keyword searches — finds founders at SMBs in target industries
-  // Uses q_organization_keywords (searches company bio/description) + SMB size filter
+  // Industry searches — requires domain root keyword + industry term to match together
+  // Filters results to companies whose name/domain actually contains the root keyword
+  const root = asset.domain.split('.')[0];
+  const rootParts = root.match(/[a-z]{3,}/gi) ?? [root];
   for (const industry of analysis.industries.slice(0, 3)) {
-    try {
-      const res = await axios.post(
-        'https://api.apollo.io/api/v1/mixed_people/api_search',
-        {
-          q_organization_keywords: industry,
-          person_seniority: ['owner', 'founder', 'c_suite'],
-          organization_num_employees_ranges: ['1,10', '11,50', '51,200'],
-          per_page: 20,
-          page: 1,
-        },
-        { headers: { 'Content-Type': 'application/json', 'X-Api-Key': config.apolloApiKey } }
-      );
-      const people: ApolloPersonResult[] = res.data?.people ?? [];
-      const withEmail = people.filter(p => p.email?.includes('@'));
-      const toReveal = people.filter(p => p.has_email && !p.email).slice(0, 8);
-      const revealed = toReveal.length ? await revealEmails(toReveal) : [];
-      for (const p of [...withEmail, ...revealed].filter(p => p.email)) {
-        leads.push({ name: [p.first_name, p.last_name].filter(Boolean).join(' '), email: p.email!, company: p.organization?.name, linkedin_url: p.linkedin_url, source: `apollo:${asset.domain}-industry`, raw_data: { industry, title: p.title, companyDomain: p.organization?.primary_domain } });
-      }
-    } catch { /* continue */ }
-    await sleep(400);
+    for (const kw of rootParts.slice(0, 2)) {
+      try {
+        const res = await axios.post(
+          'https://api.apollo.io/api/v1/mixed_people/api_search',
+          {
+            q_keywords: `${kw} ${industry}`,
+            person_seniority: ['owner', 'founder', 'c_suite'],
+            organization_num_employees_ranges: ['1,10', '11,50', '51,200'],
+            per_page: 25,
+            page: 1,
+          },
+          { headers: { 'Content-Type': 'application/json', 'X-Api-Key': config.apolloApiKey } }
+        );
+        const people: ApolloPersonResult[] = res.data?.people ?? [];
+        // Keep only people whose company name or domain actually contains our keyword
+        const relevant = people.filter(p => {
+          const co = (p.organization?.name ?? '').toLowerCase();
+          const dom = (p.organization?.primary_domain ?? '').toLowerCase();
+          return co.includes(kw) || dom.includes(kw);
+        });
+        const withEmail = relevant.filter(p => p.email?.includes('@'));
+        const toReveal = relevant.filter(p => p.has_email && !p.email).slice(0, 6);
+        const revealed = toReveal.length ? await revealEmails(toReveal) : [];
+        for (const p of [...withEmail, ...revealed].filter(p => p.email)) {
+          leads.push({ name: [p.first_name, p.last_name].filter(Boolean).join(' '), email: p.email!, company: p.organization?.name, linkedin_url: p.linkedin_url, source: `apollo:${asset.domain}-industry`, raw_data: { keyword: kw, industry, title: p.title, companyDomain: p.organization?.primary_domain } });
+        }
+      } catch { /* continue */ }
+      await sleep(400);
+    }
   }
 
   return leads;
@@ -1236,28 +1246,37 @@ export async function testNewSources(targetDomains?: string[]): Promise<{ insert
 
     if (!analysis) { errors[`apollo-industry:${asset.domain}`] = 'no analysis — run Analyze first'; continue; }
 
-    // Apollo industry org-keyword search
+    // Apollo industry search — requires domain root keyword + industry together, filters by company relevance
+    const assetRoot = asset.domain.split('.')[0];
+    const assetParts = assetRoot.match(/[a-z]{3,}/gi) ?? [assetRoot];
     for (const industry of analysis.industries.slice(0, 3)) {
-      try {
-        const res = await axios.post(
-          'https://api.apollo.io/api/v1/mixed_people/api_search',
-          { q_organization_keywords: industry, person_seniority: ['owner', 'founder', 'c_suite'], organization_num_employees_ranges: ['1,10', '11,50', '51,200'], per_page: 20, page: 1 },
-          { headers: { 'Content-Type': 'application/json', 'X-Api-Key': config.apolloApiKey } }
-        );
-        const people: ApolloPersonResult[] = res.data?.people ?? [];
-        const withEmail = people.filter(p => p.email?.includes('@'));
-        const toReveal = people.filter(p => p.has_email && !p.email).slice(0, 8);
-        const revealed = toReveal.length ? await revealEmails(toReveal) : [];
-        for (const p of [...withEmail, ...revealed].filter(p => p.email)) {
-          if (!seen.has(p.email!)) {
-            seen.add(p.email!);
-            const src = `apollo:${asset.domain}-industry`;
-            breakdown[src] = (breakdown[src] ?? 0) + 1;
-            allLeads.push({ name: [p.first_name, p.last_name].filter(Boolean).join(' '), email: p.email!, company: p.organization?.name, linkedin_url: p.linkedin_url, source: src, raw_data: { industry, title: p.title } });
+      for (const kw of assetParts.slice(0, 2)) {
+        try {
+          const res = await axios.post(
+            'https://api.apollo.io/api/v1/mixed_people/api_search',
+            { q_keywords: `${kw} ${industry}`, person_seniority: ['owner', 'founder', 'c_suite'], organization_num_employees_ranges: ['1,10', '11,50', '51,200'], per_page: 25, page: 1 },
+            { headers: { 'Content-Type': 'application/json', 'X-Api-Key': config.apolloApiKey } }
+          );
+          const people: ApolloPersonResult[] = res.data?.people ?? [];
+          const relevant = people.filter(p => {
+            const co = (p.organization?.name ?? '').toLowerCase();
+            const dom = (p.organization?.primary_domain ?? '').toLowerCase();
+            return co.includes(kw) || dom.includes(kw);
+          });
+          const withEmail = relevant.filter(p => p.email?.includes('@'));
+          const toReveal = relevant.filter(p => p.has_email && !p.email).slice(0, 6);
+          const revealed = toReveal.length ? await revealEmails(toReveal) : [];
+          for (const p of [...withEmail, ...revealed].filter(p => p.email)) {
+            if (!seen.has(p.email!)) {
+              seen.add(p.email!);
+              const src = `apollo:${asset.domain}-industry`;
+              breakdown[src] = (breakdown[src] ?? 0) + 1;
+              allLeads.push({ name: [p.first_name, p.last_name].filter(Boolean).join(' '), email: p.email!, company: p.organization?.name, linkedin_url: p.linkedin_url, source: src, raw_data: { keyword: kw, industry, title: p.title } });
+            }
           }
-        }
-      } catch (e) { errors[`apollo-industry:${industry}`] = (e as Error).message; }
-      await sleep(400);
+        } catch (e) { errors[`apollo-industry:${kw}:${industry}`] = (e as Error).message; }
+        await sleep(400);
+      }
     }
   }
 
