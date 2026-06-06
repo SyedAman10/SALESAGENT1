@@ -52,7 +52,7 @@ interface Email {
   company?: string;
 }
 
-type PipelineStep = 'analyze' | 'ingest' | 'enrich' | 'match' | 'write' | 'decide' | 'sequence' | 'test' | 'hot' | 'testnew';
+type PipelineStep = 'analyze' | 'ingest' | 'enrich' | 'match' | 'write' | 'decide' | 'sequence' | 'test' | 'hot' | 'testnew' | 'upgrade';
 
 const STEPS: { key: PipelineStep; label: string; desc: string }[] = [
   { key: 'analyze', label: '0. Analyze', desc: 'Study domain portfolio' },
@@ -155,7 +155,7 @@ export default function Dashboard() {
     }
   }, [fetchGmailAccount]);
 
-  const DOMAIN_PICKER_STEPS = new Set<PipelineStep | 'all'>(['analyze', 'ingest', 'match', 'all', 'test', 'hot', 'testnew']);
+  const DOMAIN_PICKER_STEPS = new Set<PipelineStep | 'all'>(['analyze', 'ingest', 'match', 'all', 'test', 'hot', 'testnew', 'upgrade']);
 
   function openDomainPicker(action: PipelineStep | 'all') {
     setPickerSelected(portfolio.map(d => d.domain));
@@ -304,6 +304,20 @@ export default function Dashboard() {
               <p className="text-gray-500 text-xs mt-0.5">{step.desc}</p>
             </button>
           ))}
+
+          <button onClick={() => openDomainPicker('upgrade')} disabled={!!running || sending}
+            className="px-3 py-2.5 rounded border border-emerald-600 hover:border-emerald-400 hover:bg-emerald-900/30 disabled:opacity-40 text-emerald-400 text-xs font-medium transition-colors">
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                <span>🎯</span>
+                <div className="text-left">
+                  <p className="font-semibold">Upgrade Buyers</p>
+                  <p className="text-emerald-700 font-normal text-xs">Companies using .net/.co/.org of your domain</p>
+                </div>
+              </div>
+              {running === 'upgrade' && <span className="text-emerald-300 text-xs animate-pulse">running</span>}
+            </div>
+          </button>
 
           <button onClick={() => openDomainPicker('hot')} disabled={!!running || sending}
             className="px-3 py-2.5 rounded border border-red-700 hover:border-red-500 hover:bg-red-900/30 disabled:opacity-40 text-red-400 text-xs font-medium transition-colors">

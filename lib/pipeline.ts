@@ -1367,6 +1367,102 @@ export async function testApifyApollo(targetDomains?: string[]): Promise<{ inser
   return { inserted, skipped, sources, breakdown, errors };
 }
 
+// ── UPGRADE BUYER FINDER ─────────────────────────────────────────────────────
+// Finds companies already using weaker TLD variants of your domain.
+// e.g. if you own indikaclub.com, finds whoever is running indikaclub.net/.co/.org
+// These are the highest-intent leads — they already want this exact brand.
+
+const PARKING_PHRASES = [
+  'domain for sale', 'buy this domain', 'domain parking', 'this domain is parked',
+  'sedoparking', 'hugedomains', 'afternic', 'godaddy parking', 'sedo.com',
+  'dan.com', 'undeveloped.com', 'squadhelp', 'brandpa', 'register this domain',
+];
+
+async function checkDomainLive(domain: string): Promise<boolean> {
+  for (const protocol of ['https', 'http']) {
+    try {
+      const res = await axios.get(`${protocol}://${domain}`, {
+        timeout: 7000,
+        maxRedirects: 3,
+        headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' },
+      });
+      if (res.status >= 200 && res.status < 400) {
+        const html = (res.data as string).toLowerCase();
+        return !PARKING_PHRASES.some(p => html.includes(p));
+      }
+    } catch { continue; }
+  }
+  return false;
+}
+
+export async function findUpgradeBuyers(targetDomains?: string[]): Promise<{
+  inserted: number; skipped: number; liveVariants: string[];
+  breakdown: Record<string, number>; errors: Record<string, string>;
+}> {
+  const portfolio = loadPortfolio(targetDomains);
+  const allLeads: RawLead[] = [];
+  const seen = new Set<string>();
+  const liveVariants: string[] = [];
+  const breakdown: Record<string, number> = { 'checked': 0, 'live': 0, 'apollo': 0, 'contact': 0 };
+  const errors: Record<string, string> = {};
+
+  for (const asset of portfolio) {
+    const baseName = asset.domain.replace(/\.(com|net|org|io|co|club|app|us|biz|info)$/i, '');
+    const candidates = [
+      `${baseName}.net`, `${baseName}.co`, `${baseName}.org`, `${baseName}.club`,
+      `${baseName}.io`, `${baseName}.app`, `${baseName}.us`, `${baseName}.biz`,
+    ];
+    breakdown['checked'] += candidates.length;
+
+    for (const candidate of candidates) {
+      let isLive = false;
+      try { isLive = await checkDomainLive(candidate); } catch { /* skip */ }
+      if (!isLive) { await sleep(300); continue; }
+
+      breakdown['live']++;
+      liveVariants.push(candidate);
+
+      // Apollo org_domains lookup — most accurate
+      try {
+        const apolloLeads = await apolloReverseFromDomainUrl(candidate, 'upgrade:buyer');
+        for (const l of apolloLeads) {
+          if (!seen.has(l.email)) {
+            seen.add(l.email);
+            breakdown['apollo']++;
+            allLeads.push({
+              ...l,
+              source: 'upgrade:buyer',
+              raw_data: { ...(l.raw_data as object), upgrade_from: candidate, upgrade_to: asset.domain },
+            });
+          }
+        }
+      } catch (e) { errors[`apollo:${candidate}`] = (e as Error).message; }
+
+      // Fallback: scrape their contact page directly
+      if (!allLeads.some(l => (l.raw_data as Record<string, string>)?.upgrade_from === candidate)) {
+        try {
+          const email = await extractBusinessEmail(candidate);
+          if (email && !seen.has(email)) {
+            seen.add(email);
+            breakdown['contact']++;
+            allLeads.push({
+              name: email.split('@')[0],
+              email,
+              source: 'upgrade:buyer',
+              raw_data: { upgrade_from: candidate, upgrade_to: asset.domain, method: 'contact-page' },
+            });
+          }
+        } catch (e) { errors[`contact:${candidate}`] = (e as Error).message; }
+      }
+
+      await sleep(500);
+    }
+  }
+
+  const { inserted, skipped } = await upsertLeads(allLeads);
+  return { inserted, skipped, liveVariants, breakdown, errors };
+}
+
 // ── ENRICH ────────────────────────────────────────────────────────────────────
 
 export interface LeadEnrichment {
@@ -1596,7 +1692,7 @@ Return valid JSON only.`;
 // ── WRITE ─────────────────────────────────────────────────────────────────────
 
 export async function writeEmails(): Promise<{ written: number }> {
-  const leads = await sql`SELECT DISTINCT l.id, l.name, l.email, l.company, l.enrichment, l.raw_data FROM leads l INNER JOIN lead_domain_matches ldm ON ldm.lead_id = l.id WHERE l.status = 'enriched' AND l.id NOT IN (SELECT DISTINCT lead_id FROM emails WHERE sequence_day = 1)` as (LeadRow & { raw_data: string })[];
+  const leads = await sql`SELECT DISTINCT l.id, l.name, l.email, l.company, l.enrichment, l.raw_data, l.source FROM leads l INNER JOIN lead_domain_matches ldm ON ldm.lead_id = l.id WHERE l.status = 'enriched' AND l.id NOT IN (SELECT DISTINCT lead_id FROM emails WHERE sequence_day = 1)` as LeadRow[];
   let written = 0;
 
   for (const lead of leads) {
@@ -1671,11 +1767,19 @@ Domain:
     ? `\nCompany website snippet (use 1 specific detail to personalize): "${companyContext.slice(0, 300)}"`
     : '';
 
+  // Detect upgrade buyer and use a tailored pitch
+  let rawData: Record<string, string> = {};
+  try { rawData = JSON.parse(lead.raw_data ?? '{}') as Record<string, string>; } catch { /* ok */ }
+  const isUpgradeBuyer = lead.source === 'upgrade:buyer' && rawData.upgrade_from;
+  const upgradeContext = isUpgradeBuyer
+    ? `\nUPGRADE BUYER: This person is currently using ${rawData.upgrade_from} — they already have this exact brand, just on a weaker TLD. Lead with this: "I noticed you're running [their business] on ${rawData.upgrade_from} — I own ${rawData.upgrade_to} and thought you might want the .com." This is NOT a cold pitch — they already invested in this brand.`
+    : '';
+
   return `Write a cold domain sales email. Sound like a real person, not a template.
 
 Recipient: ${lead.name}${lead.company ? ` @ ${lead.company}` : ''}
 Buyer signals: ${enrichment.key_signals.join('; ')}
-Domain fit: ${match.domain} — ${match.relevance_reasoning}${domainInsights}${companySnippet}
+Domain fit: ${match.domain} — ${match.relevance_reasoning}${domainInsights}${companySnippet}${upgradeContext}
 Price placeholder: [PRICE]
 
 Style: ${variantInstructions[variant as keyof typeof variantInstructions]}
@@ -1683,7 +1787,7 @@ Style: ${variantInstructions[variant as keyof typeof variantInstructions]}
 Rules (strict):
 - Under 100 words total
 - Subject: 3–6 words, name the domain or their company specifically, no buzzwords (bad: "domain opportunity", good: "${match.domain} — quick question")
-- Reference ONE specific thing about their business from the company snippet or buyer signals
+${isUpgradeBuyer ? `- Open with: "I noticed you're on ${rawData.upgrade_from}..." — this is your hook, use it` : '- Reference ONE specific thing about their business from the company snippet or buyer signals'}
 - End with a single yes/no question
 - Sign as ${config.fromName}
 
@@ -1971,5 +2075,5 @@ export async function getSentEmails() {
   `;
 }
 
-interface LeadRow { id: number; name: string; email: string; company: string | null; raw_data: string; enrichment: string; }
+interface LeadRow { id: number; name: string; email: string; company: string | null; raw_data: string; enrichment: string; source: string | null; }
 function sleep(ms: number) { return new Promise(r => setTimeout(r, ms)); }
