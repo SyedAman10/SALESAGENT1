@@ -1180,6 +1180,37 @@ async function scrapeRedditJSON(kwSet: Set<string>): Promise<{ leads: RawLead[];
 // All discovered domain names → Apollo org domain lookup → founder/CEO emails
 // Fallback: Apollo direct people search based on domain analysis
 
+async function generateApolloTitleSearches(asset: Asset, analysis: DomainAnalysis): Promise<{ titles: string[]; label: string }[]> {
+  try {
+    const res = await client.messages.create({
+      model: config.model,
+      max_tokens: 600,
+      messages: [{
+        role: 'user',
+        content: `You are a B2B sales expert. Generate Apollo.io job title searches for people who would BUY this domain.
+
+Domain: ${asset.domain} ($${asset.asking_price.toLocaleString()})
+Buyer summary: ${analysis.buyer_profile_summary}
+Ideal buyers: ${analysis.ideal_buyer_types.filter(t => !t.toLowerCase().includes('domain')).join(', ')}
+
+Generate 5 groups of EXACT job titles people would have on LinkedIn.
+These must be REAL titles (e.g. "Gym Owner", "Fitness Studio Owner") not descriptions.
+Target people who run businesses that would USE this domain — NOT domain investors.
+
+Return JSON only:
+[{"label": "gym owners", "titles": ["Gym Owner", "Fitness Studio Owner", "Health Club Owner"]}, ...]`,
+      }],
+    });
+    const text = res.content[0].type === 'text' ? res.content[0].text : '[]';
+    return JSON.parse(text.replace(/```json\n?|\n?```/g, '').trim()) as { titles: string[]; label: string }[];
+  } catch {
+    return [
+      { label: 'founders', titles: ['Founder', 'Co-Founder', 'Owner', 'CEO'] },
+      { label: 'operators', titles: ['Managing Director', 'Director', 'President', 'General Manager'] },
+    ];
+  }
+}
+
 export async function testNewSources(targetDomains?: string[]): Promise<{ inserted: number; skipped: number; breakdown: Record<string, number>; errors: Record<string, string> }> {
   const portfolio = loadPortfolio(targetDomains);
   const allLeads: RawLead[] = [];
@@ -1189,25 +1220,18 @@ export async function testNewSources(targetDomains?: string[]): Promise<{ insert
 
   for (const asset of portfolio) {
     const analysis = await getDomainAnalysis(asset.domain);
+    if (!analysis) { errors[asset.domain] = 'no analysis — run Analyze first'; continue; }
 
-    if (!analysis) { errors[`apollo-industry:${asset.domain}`] = 'no analysis — run Analyze first'; continue; }
+    // Claude generates exact LinkedIn job titles → Apollo title search (far more reliable than q_keywords)
+    const titleSearches = await generateApolloTitleSearches(asset, analysis);
 
-    // Apollo buyer-type search — ideal_buyer_types as q_keywords + owner/founder titles
-    const endUserBuyerTypes = analysis.ideal_buyer_types.filter(t =>
-      !t.toLowerCase().includes('domain investor') && !t.toLowerCase().includes('broker') && !t.toLowerCase().includes('resale')
-    ).slice(0, 5);
-
-    if (endUserBuyerTypes.length === 0) {
-      errors[`apollo-industry:${asset.domain}`] = 'no end-user buyer types in analysis';
-    }
-
-    for (const buyerType of endUserBuyerTypes) {
+    for (const search of titleSearches) {
       try {
         const res = await axios.post(
           'https://api.apollo.io/api/v1/mixed_people/api_search',
           {
-            person_titles: ['Founder', 'Co-Founder', 'Owner', 'CEO', 'President', 'Managing Director', 'Director'],
-            q_keywords: buyerType,
+            person_titles: search.titles,
+            person_seniority: ['owner', 'founder', 'c_suite', 'partner', 'vp'],
             per_page: 25,
             page: 1,
           },
@@ -1218,32 +1242,31 @@ export async function testNewSources(targetDomains?: string[]): Promise<{ insert
         const toReveal = people.filter(p => p.has_email && !p.email).slice(0, 8);
         const revealed = toReveal.length ? await revealEmails(toReveal) : [];
         const found = [...withEmail, ...revealed].filter(p => p.email);
-        if (found.length === 0 && people.length > 0) {
-          errors[`apollo-reveal:${buyerType}`] = `${people.length} results but 0 emails revealed — check Apollo plan`;
+
+        if (people.length > 0 && found.length === 0) {
+          errors[`reveal:${search.label}`] = `${people.length} found, 0 emails — upgrade Apollo plan to reveal`;
         }
         for (const p of found) {
           if (!seen.has(p.email!)) {
             seen.add(p.email!);
-            const src = `apollo:${asset.domain}-industry`;
+            const src = `apollo:${asset.domain}-titles`;
             breakdown[src] = (breakdown[src] ?? 0) + 1;
-            allLeads.push({ name: [p.first_name, p.last_name].filter(Boolean).join(' '), email: p.email!, company: p.organization?.name, linkedin_url: p.linkedin_url, source: src, raw_data: { buyerType, title: p.title } });
+            allLeads.push({ name: [p.first_name, p.last_name].filter(Boolean).join(' '), email: p.email!, company: p.organization?.name, linkedin_url: p.linkedin_url, source: src, raw_data: { label: search.label, title: p.title, company: p.organization?.name } });
           }
         }
-      } catch (e) { errors[`apollo-industry:${buyerType}`] = (e as Error).message; }
-      await sleep(400);
+      } catch (e) { errors[`apollo:${search.label}`] = (e as Error).message; }
+      await sleep(500);
     }
 
-    // Also run Google Maps scraping for this domain
-    try {
-      const mapsLeads = await scrapeGoogleMapsLeads(analysis);
-      for (const l of mapsLeads) {
-        if (!seen.has(l.email)) {
-          seen.add(l.email);
-          breakdown['apify:googlemaps'] = (breakdown['apify:googlemaps'] ?? 0) + 1;
-          allLeads.push(l);
-        }
+    // Google Maps businesses → Apollo domain reverse lookup
+    const mapsLeads = await scrapeGoogleMapsLeads(analysis);
+    for (const l of mapsLeads) {
+      if (!seen.has(l.email)) {
+        seen.add(l.email);
+        breakdown['apify:googlemaps'] = (breakdown['apify:googlemaps'] ?? 0) + 1;
+        allLeads.push(l);
       }
-    } catch (e) { errors['apify:googlemaps'] = (e as Error).message; }
+    }
   }
 
   const { inserted, skipped } = await upsertLeads(allLeads);
