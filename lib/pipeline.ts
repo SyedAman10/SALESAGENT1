@@ -563,8 +563,14 @@ async function apolloReverseFromDomainUrl(domain: string, source: string): Promi
       { headers: { 'Content-Type': 'application/json', 'X-Api-Key': config.apolloApiKey } }
     );
     const people: ApolloPersonResult[] = res.data?.people ?? [];
-    const withEmail = people.filter(p => p.email?.includes('@'));
-    const toReveal = people.filter(p => p.has_email && !p.email).slice(0, 5);
+    // Strict filter: only keep people whose company's primary domain actually matches
+    const domainBase = domain.split('.')[0].toLowerCase();
+    const relevant = people.filter(p => {
+      const orgDomain = (p.organization?.primary_domain ?? '').toLowerCase();
+      return orgDomain === domain || orgDomain.includes(domainBase);
+    });
+    const withEmail = relevant.filter(p => p.email?.includes('@'));
+    const toReveal = relevant.filter(p => p.has_email && !p.email).slice(0, 5);
     const revealed = toReveal.length ? await revealEmails(toReveal) : [];
     return [...withEmail, ...revealed].filter(p => p.email).map(p => ({
       name: [p.first_name, p.last_name].filter(Boolean).join(' '),
