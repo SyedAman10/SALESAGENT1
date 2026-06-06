@@ -2158,4 +2158,73 @@ export async function getSentEmails() {
 }
 
 interface LeadRow { id: number; name: string; email: string; company: string | null; raw_data: string; enrichment: string; source: string | null; }
+
+// ── BROKER PITCHES ────────────────────────────────────────────────────────────
+
+const BROKERS = [
+  { name: 'MediaOptions', website: 'mediaoptions.com', specialty: 'premium brandable domains $2k–$500k, strong end-user buyer network' },
+  { name: 'DomainAgents', website: 'domainagents.com', specialty: 'professional brokerage with buyer/seller matching' },
+  { name: 'Grit Brokerage', website: 'gritbrokerage.com', specialty: 'emerging brandable domains, startup-focused buyers' },
+  { name: 'Sedo Brokerage', website: 'sedo.com', specialty: "world's largest domain marketplace, global buyer network" },
+];
+
+export interface BrokerPitch {
+  broker: string;
+  website: string;
+  domain: string;
+  subject: string;
+  body: string;
+}
+
+export async function generateBrokerPitches(targetDomains?: string[]): Promise<BrokerPitch[]> {
+  const portfolio = loadPortfolio(targetDomains);
+  const pitches: BrokerPitch[] = [];
+
+  for (const asset of portfolio) {
+    const analysis = await getDomainAnalysis(asset.domain);
+    const analysisContext = analysis ? `
+Buyer profile: ${analysis.buyer_profile_summary}
+Target industries: ${analysis.industries.join(', ')}
+Ideal buyers: ${analysis.ideal_buyer_types.join(', ')}
+Comparable sales: ${analysis.comparable_sales.join('; ')}
+Value propositions: ${analysis.value_props.join('; ')}` : '';
+
+    for (const broker of BROKERS) {
+      try {
+        const res = await client.messages.create({
+          model: config.model,
+          max_tokens: 500,
+          messages: [{
+            role: 'user',
+            content: `Write a professional domain brokerage outreach email.
+
+Domain: ${asset.domain}
+Asking price: $${asset.asking_price.toLocaleString()}${analysisContext}
+
+Broker firm: ${broker.name} (${broker.website})
+Broker specialty: ${broker.specialty}
+
+Write a concise pitch email (150–180 words) to this brokerage asking them to represent or co-broker this domain.
+Include: why the domain is brandable/valuable, target buyer profile, asking price, commission offer (standard 10–15%), brief CTA.
+Professional but direct. No generic filler. No "Dear [Name]" — open directly.
+
+First line must be: Subject: <subject line>
+Then a blank line, then the email body.`,
+          }],
+        });
+
+        const text = res.content[0].type === 'text' ? res.content[0].text.trim() : '';
+        const lines = text.split('\n');
+        const subjectIdx = lines.findIndex(l => l.toLowerCase().startsWith('subject:'));
+        const subject = subjectIdx >= 0 ? lines[subjectIdx].replace(/^subject:\s*/i, '').trim() : `Brokerage opportunity: ${asset.domain}`;
+        const bodyLines = subjectIdx >= 0 ? lines.slice(subjectIdx + 1) : lines;
+        const body = bodyLines.join('\n').replace(/^\n+/, '').trim();
+
+        pitches.push({ broker: broker.name, website: broker.website, domain: asset.domain, subject, body });
+      } catch { /* skip failed broker */ }
+    }
+  }
+
+  return pitches;
+}
 function sleep(ms: number) { return new Promise(r => setTimeout(r, ms)); }

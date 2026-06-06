@@ -54,6 +54,14 @@ interface Email {
 
 type PipelineStep = 'analyze' | 'ingest' | 'enrich' | 'match' | 'write' | 'decide' | 'sequence' | 'test' | 'hot' | 'testnew' | 'upgrade' | 'namematch';
 
+interface BrokerPitch {
+  broker: string;
+  website: string;
+  domain: string;
+  subject: string;
+  body: string;
+}
+
 const STEPS: { key: PipelineStep; label: string; desc: string }[] = [
   { key: 'analyze', label: '0. Analyze', desc: 'Study domain portfolio' },
   { key: 'ingest', label: '1. Ingest', desc: 'Domain-specific + broker leads' },
@@ -78,7 +86,7 @@ export default function Dashboard() {
   const [stats, setStats] = useState<Stats | null>(null);
   const [leads, setLeads] = useState<Lead[]>([]);
   const [emails, setEmails] = useState<Email[]>([]);
-  const [activeTab, setActiveTab] = useState<'overview' | 'leads' | 'emails' | 'sent' | 'analysis'>('overview');
+  const [activeTab, setActiveTab] = useState<'overview' | 'leads' | 'emails' | 'sent' | 'analysis' | 'broker'>('overview');
   const [running, setRunning] = useState<string | null>(null);
   const [log, setLog] = useState<string[]>([]);
   const [selectedEmail, setSelectedEmail] = useState<Email | null>(null);
@@ -98,6 +106,9 @@ export default function Dashboard() {
   const [warmupSeedInput, setWarmupSeedInput] = useState('');
   const [warmupRunning, setWarmupRunning] = useState(false);
   const [showWarmup, setShowWarmup] = useState(false);
+  const [brokerPitches, setBrokerPitches] = useState<BrokerPitch[]>([]);
+  const [brokerLoading, setBrokerLoading] = useState(false);
+  const [copiedKey, setCopiedKey] = useState<string | null>(null);
 
   const fetchGmailAccount = useCallback(async () => {
     const res = await fetch('/api/gmail-account');
@@ -278,10 +289,10 @@ export default function Dashboard() {
           <p className="text-gray-500 text-xs mt-0.5">indikaclub.com · $3,900</p>
         </div>
         <div className="flex gap-2">
-          {(['overview', 'leads', 'emails', 'sent', 'analysis'] as const).map(tab => (
+          {(['overview', 'leads', 'emails', 'sent', 'analysis', 'broker'] as const).map(tab => (
             <button key={tab} onClick={() => { setActiveTab(tab); if (tab === 'sent') fetchSentEmails(); if (tab === 'analysis') fetchPortfolio(); }}
               className={`px-3 py-1.5 rounded text-xs capitalize ${activeTab === tab ? 'bg-gray-700 text-white' : 'text-gray-400 hover:text-white'}`}>
-              {tab === 'overview' ? 'Overview' : tab === 'leads' ? `Leads (${total})` : tab === 'emails' ? `Approved (${emails.length})` : tab === 'sent' ? `Sent (${sentEmails.length})` : `Domains (${portfolio.length})`}
+              {tab === 'overview' ? 'Overview' : tab === 'leads' ? `Leads (${total})` : tab === 'emails' ? `Approved (${emails.length})` : tab === 'sent' ? `Sent (${sentEmails.length})` : tab === 'broker' ? `Brokers (${brokerPitches.length})` : `Domains (${portfolio.length})`}
             </button>
           ))}
         </div>
@@ -330,6 +341,33 @@ export default function Dashboard() {
                 </div>
               </div>
               {running === 'namematch' && <span className="text-violet-300 text-xs animate-pulse">running</span>}
+            </div>
+          </button>
+
+          <button onClick={async () => {
+            setBrokerLoading(true);
+            setActiveTab('broker');
+            try {
+              const qs = portfolio.map(d => `domain=${encodeURIComponent(d.domain)}`).join('&');
+              const res = await fetch(`/api/broker-pitches?${qs}`);
+              const data = await res.json() as { ok: boolean; pitches: BrokerPitch[]; error?: string };
+              if (data.ok) setBrokerPitches(data.pitches);
+              else setLog(prev => [...prev, `✗ broker pitches failed — ${data.error}`]);
+            } catch (e) {
+              setLog(prev => [...prev, `✗ broker pitches error — ${(e as Error).message}`]);
+            }
+            setBrokerLoading(false);
+          }} disabled={!!running || sending || brokerLoading}
+            className="px-3 py-2.5 rounded border border-orange-700 hover:border-orange-500 hover:bg-orange-900/30 disabled:opacity-40 text-orange-400 text-xs font-medium transition-colors">
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                <span>✉️</span>
+                <div className="text-left">
+                  <p className="font-semibold">Broker Outreach</p>
+                  <p className="text-orange-700 font-normal text-xs">Generate pitches for MediaOptions, Sedo + more</p>
+                </div>
+              </div>
+              {brokerLoading && <span className="text-orange-300 text-xs animate-pulse">generating</span>}
             </div>
           </button>
 
@@ -754,6 +792,68 @@ export default function Dashboard() {
                   )}
                 </div>
               ))}
+            </div>
+          )}
+
+          {activeTab === 'broker' && (
+            <div className="space-y-4">
+              {brokerPitches.length === 0 && !brokerLoading && (
+                <div className="text-center py-12">
+                  <p className="text-gray-500 text-xs mb-2">No pitches generated yet.</p>
+                  <p className="text-gray-600 text-xs">Click <span className="text-orange-400">✉️ Broker Outreach</span> in the sidebar to generate Claude-written pitch emails for domain brokers.</p>
+                </div>
+              )}
+              {brokerLoading && (
+                <div className="text-center py-12">
+                  <p className="text-orange-400 text-xs animate-pulse">Generating broker pitches with Claude...</p>
+                </div>
+              )}
+              {brokerPitches.length > 0 && (
+                <div className="space-y-6">
+                  {portfolio.map(d => {
+                    const domainPitches = brokerPitches.filter(p => p.domain === d.domain);
+                    if (domainPitches.length === 0) return null;
+                    return (
+                      <div key={d.domain}>
+                        <p className="text-gray-500 text-xs uppercase tracking-wider mb-3">{d.domain} — ${d.asking_price.toLocaleString()}</p>
+                        <div className="grid grid-cols-2 gap-3">
+                          {domainPitches.map(pitch => {
+                            const key = `${pitch.domain}-${pitch.broker}`;
+                            return (
+                              <div key={key} className="bg-gray-900 border border-gray-800 rounded-lg p-4 space-y-3">
+                                <div className="flex items-start justify-between gap-2">
+                                  <div>
+                                    <p className="text-white text-xs font-semibold">{pitch.broker}</p>
+                                    <a href={`https://${pitch.website}`} target="_blank" rel="noopener noreferrer"
+                                      className="text-blue-500 hover:text-blue-400 text-xs">{pitch.website} ↗</a>
+                                  </div>
+                                  <button
+                                    onClick={() => {
+                                      void navigator.clipboard.writeText(`Subject: ${pitch.subject}\n\n${pitch.body}`);
+                                      setCopiedKey(key);
+                                      setTimeout(() => setCopiedKey(null), 2000);
+                                    }}
+                                    className={`flex-shrink-0 px-2.5 py-1 rounded text-xs font-medium transition-colors ${copiedKey === key ? 'bg-green-700 text-green-100' : 'bg-gray-700 hover:bg-gray-600 text-gray-300'}`}>
+                                    {copiedKey === key ? 'Copied!' : 'Copy'}
+                                  </button>
+                                </div>
+                                <div>
+                                  <p className="text-gray-500 text-xs">Subject</p>
+                                  <p className="text-gray-200 text-xs mt-0.5">{pitch.subject}</p>
+                                </div>
+                                <div>
+                                  <p className="text-gray-500 text-xs mb-1">Body</p>
+                                  <pre className="text-gray-300 text-xs whitespace-pre-wrap leading-relaxed border-t border-gray-800 pt-2">{pitch.body}</pre>
+                                </div>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
             </div>
           )}
 
