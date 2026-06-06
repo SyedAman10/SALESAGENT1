@@ -1225,46 +1225,39 @@ export async function testNewSources(targetDomains?: string[]): Promise<{ insert
     // Claude generates exact LinkedIn job titles → Apollo title search (far more reliable than q_keywords)
     const titleSearches = await generateApolloTitleSearches(asset, analysis);
 
+    // 3 pages per title group — 3x more coverage from the same searches
     for (const search of titleSearches) {
-      try {
-        const res = await axios.post(
-          'https://api.apollo.io/api/v1/mixed_people/api_search',
-          {
-            person_titles: search.titles,
-            person_seniority: ['owner', 'founder', 'c_suite', 'partner', 'vp'],
-            per_page: 25,
-            page: 1,
-          },
-          { headers: { 'Content-Type': 'application/json', 'X-Api-Key': config.apolloApiKey } }
-        );
-        const people: ApolloPersonResult[] = res.data?.people ?? [];
-        const withEmail = people.filter(p => p.email?.includes('@'));
-        const toReveal = people.filter(p => p.has_email && !p.email).slice(0, 8);
-        const revealed = toReveal.length ? await revealEmails(toReveal) : [];
-        const found = [...withEmail, ...revealed].filter(p => p.email);
-
-        if (people.length > 0 && found.length === 0) {
-          errors[`reveal:${search.label}`] = `${people.length} found, 0 emails — upgrade Apollo plan to reveal`;
-        }
-        for (const p of found) {
-          if (!seen.has(p.email!)) {
-            seen.add(p.email!);
-            const src = `apollo:${asset.domain}-titles`;
-            breakdown[src] = (breakdown[src] ?? 0) + 1;
-            allLeads.push({ name: [p.first_name, p.last_name].filter(Boolean).join(' '), email: p.email!, company: p.organization?.name, linkedin_url: p.linkedin_url, source: src, raw_data: { label: search.label, title: p.title, company: p.organization?.name } });
+      for (let page = 1; page <= 3; page++) {
+        try {
+          const res = await axios.post(
+            'https://api.apollo.io/api/v1/mixed_people/api_search',
+            {
+              person_titles: search.titles,
+              person_seniority: ['owner', 'founder', 'c_suite', 'partner', 'vp'],
+              per_page: 25,
+              page,
+            },
+            { headers: { 'Content-Type': 'application/json', 'X-Api-Key': config.apolloApiKey } }
+          );
+          const people: ApolloPersonResult[] = res.data?.people ?? [];
+          if (people.length === 0) break;
+          const withEmail = people.filter(p => p.email?.includes('@'));
+          const toReveal = people.filter(p => p.has_email && !p.email).slice(0, 8);
+          const revealed = toReveal.length ? await revealEmails(toReveal) : [];
+          const found = [...withEmail, ...revealed].filter(p => p.email);
+          if (page === 1 && people.length > 0 && found.length === 0) {
+            errors[`reveal:${search.label}`] = `${people.length} found, 0 emails — upgrade Apollo plan to reveal`;
           }
-        }
-      } catch (e) { errors[`apollo:${search.label}`] = (e as Error).message; }
-      await sleep(500);
-    }
-
-    // Google Maps businesses → Apollo domain reverse lookup
-    const mapsLeads = await scrapeGoogleMapsLeads(analysis);
-    for (const l of mapsLeads) {
-      if (!seen.has(l.email)) {
-        seen.add(l.email);
-        breakdown['apify:googlemaps'] = (breakdown['apify:googlemaps'] ?? 0) + 1;
-        allLeads.push(l);
+          for (const p of found) {
+            if (!seen.has(p.email!)) {
+              seen.add(p.email!);
+              const src = `apollo:${asset.domain}-titles`;
+              breakdown[src] = (breakdown[src] ?? 0) + 1;
+              allLeads.push({ name: [p.first_name, p.last_name].filter(Boolean).join(' '), email: p.email!, company: p.organization?.name, linkedin_url: p.linkedin_url, source: src, raw_data: { label: search.label, title: p.title, company: p.organization?.name } });
+            }
+          }
+        } catch (e) { errors[`apollo:${search.label}:p${page}`] = (e as Error).message; break; }
+        await sleep(500);
       }
     }
   }
@@ -1273,188 +1266,98 @@ export async function testNewSources(targetDomains?: string[]): Promise<{ insert
   return { inserted, skipped, breakdown, errors };
 }
 
+async function getGoogleMapsBusinesses(analysis: DomainAnalysis): Promise<{ name?: string; website?: string; address?: string }[]> {
+  if (!config.apifyApiKey) return [];
+  const searchTerms = [
+    ...analysis.industries.slice(0, 2),
+    ...analysis.ideal_buyer_types.filter(t => !t.toLowerCase().includes('domain') && !t.toLowerCase().includes('broker')).slice(0, 2),
+  ].filter(Boolean);
+  if (!searchTerms.length) return [];
+
+  try {
+    const runRes = await axios.post(
+      `https://api.apify.com/v2/acts/apify~google-maps-scraper/runs?token=${config.apifyApiKey}`,
+      { searchStringsArray: searchTerms.slice(0, 4), maxCrawledPlaces: 20, language: 'en', countryCode: 'us', maxImages: 0, additionalInfo: false },
+      { timeout: 20000 }
+    );
+    const runId: string = runRes.data?.data?.id;
+    if (!runId) return [];
+    for (let i = 0; i < 36; i++) {
+      await sleep(5000);
+      const st = await axios.get(`https://api.apify.com/v2/actor-runs/${runId}?token=${config.apifyApiKey}`);
+      const status: string = st.data?.data?.status;
+      if (status === 'SUCCEEDED') break;
+      if (status === 'FAILED' || status === 'ABORTED') return [];
+    }
+    const items = await axios.get(`https://api.apify.com/v2/actor-runs/${runId}/dataset/items?token=${config.apifyApiKey}`);
+    return (items.data as { title?: string; website?: string; address?: string }[]).map(i => ({
+      name: i.title, website: i.website, address: i.address,
+    }));
+  } catch (err) {
+    console.error('[GMaps]', (err as Error).message);
+    return [];
+  }
+}
+
+async function extractBusinessEmail(websiteUrl: string): Promise<string | null> {
+  const emailRegex = /[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}/g;
+  const skipPrefixes = ['noreply', 'no-reply', 'donotreply', 'webmaster', 'postmaster'];
+  const skipDomains = ['example.com', 'sentry.io', 'cloudflare.com', 'google.com', 'w3.org', 'schema.org', 'apple.com', 'wix.com', 'squarespace.com'];
+  const domain = websiteUrl.replace(/^https?:\/\/(www\.)?/, '').split('/')[0].toLowerCase();
+  const base = `https://${domain}`;
+  for (const path of ['', '/contact', '/contact-us', '/about']) {
+    try {
+      const res = await axios.get(`${base}${path}`, {
+        timeout: 6000,
+        headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' },
+        maxRedirects: 3,
+      });
+      const emails = (res.data as string).match(emailRegex) ?? [];
+      const valid = emails.find(e =>
+        !skipDomains.some(d => e.endsWith(`@${d}`)) &&
+        !skipPrefixes.some(p => e.toLowerCase().startsWith(p))
+      );
+      if (valid) return valid;
+    } catch { continue; }
+  }
+  return null;
+}
+
+// Pure Apify workflow: Google Maps → contact page scraping → real business emails (no Apollo)
 export async function testApifyApollo(targetDomains?: string[]): Promise<{ inserted: number; skipped: number; sources: Record<string, number>; breakdown: Record<string, number>; errors: Record<string, string> }> {
   const portfolio = loadPortfolio(targetDomains);
   const allLeads: RawLead[] = [];
   const seen = new Set<string>();
-  const breakdown: Record<string, number> = { 'sedo:direct': 0, 'afternic:apify': 0, 'expireddomains:apify': 0, 'apollo:reverse': 0, 'apollo:direct': 0 };
+  const breakdown: Record<string, number> = { 'googlemaps:found': 0, 'googlemaps:with-website': 0, 'contact:emails': 0 };
   const errors: Record<string, string> = {};
 
   for (const asset of portfolio) {
     const analysis = await getDomainAnalysis(asset.domain);
-    const rootKw = asset.domain.split('.')[0];
-    const industryKws = analysis?.industries.slice(0, 2).map(i => i.split(' ')[0]) ?? [];
-    const keywords = [...new Set([rootKw, ...industryKws])].filter(k => k.length > 2).slice(0, 3);
+    if (!analysis) { errors[asset.domain] = 'no analysis — run Analyze first'; continue; }
 
-    const discoveredDomains: string[] = [];
-    const domainRe = /^[a-z0-9][a-z0-9-]{1,50}\.(com|net|org|io|co|club|app|us|biz|info)$/i;
+    // Phase 1: Google Maps → find relevant local businesses
+    const businesses = await getGoogleMapsBusinesses(analysis);
+    breakdown['googlemaps:found'] += businesses.length;
+    const withWebsite = businesses.filter(b => b.website);
+    breakdown['googlemaps:with-website'] += withWebsite.length;
 
-    // ── Phase 1a: Sedo marketplace search — direct HTTP ─────────────────────
-    for (const kw of keywords.slice(0, 2)) {
+    // Phase 2: For each business website, extract contact email directly (no Apollo)
+    for (const biz of withWebsite.slice(0, 25)) {
       try {
-        const res = await axios.get(
-          `https://sedo.com/search/searchresult.php4?keyword=${encodeURIComponent(kw)}&language=e&searchOptions=2`,
-          {
-            headers: {
-              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/121.0.0.0 Safari/537.36',
-              'Accept': 'text/html,application/xhtml+xml',
-              'Accept-Language': 'en-US,en;q=0.9',
-              'Referer': 'https://sedo.com/',
-            },
-            timeout: 12000,
-          }
-        );
-        const $ = cheerio.load(res.data as string);
-        let found = 0;
-        $('td, .domain, [class*="domain"], a').each((_, el) => {
-          const txt = $(el).text().trim().toLowerCase().split(/\s+/)[0];
-          if (domainRe.test(txt) && !txt.includes('sedo')) { discoveredDomains.push(txt); found++; }
-        });
-        breakdown['sedo:direct'] = (breakdown['sedo:direct'] ?? 0) + found;
-      } catch (e) {
-        errors[`sedo:${kw}`] = (e as Error).message;
-      }
-      await sleep(800);
-    }
-
-    // ── Phase 1c: Afternic + GoDaddy Auctions via Apify (JS-rendered) ─────────
-    if (config.apifyApiKey) {
-      const auctionUrls = [
-        ...keywords.slice(0, 2).map(kw => ({ url: `https://www.afternic.com/forsale?q=${encodeURIComponent(kw)}`, site: 'afternic' })),
-        ...keywords.slice(0, 1).map(kw => ({ url: `https://www.expireddomains.net/domain-name-search/?q=${encodeURIComponent(kw)}&fwhois=22&fdomain=1`, site: 'expireddomains' })),
-      ];
-
-      try {
-        const runRes = await axios.post(
-          `https://api.apify.com/v2/acts/apify~playwright-scraper/runs?token=${config.apifyApiKey}`,
-          {
-            startUrls: auctionUrls.map(u => ({ url: u.url, userData: { site: u.site } })),
-            pageFunction: `async function pageFunction({ page, request }) {
-              const site = (request.userData || {}).site || 'unknown';
-              await page.waitForTimeout(6000);
-              const skipHosts = ['afternic.com','godaddy.com','apify.com','cloudflare.com','google.com','sedo.com','verisign.com','icann.org'];
-              const re = /\\b([a-z0-9][a-z0-9-]{1,50}\\.(com|net|org|io|co|club|app|us|biz|info))\\b/gi;
-              const text = await page.evaluate(() => document.body ? document.body.innerText : '');
-              const found = [...new Set((text.match(re) || []).map(d => d.toLowerCase()))]
-                .filter(d => !skipHosts.some(s => d.endsWith(s) || d.includes('.' + s)));
-              return found.slice(0, 50).map(d => ({ domain: d, site }));
-            }`,
-            proxyConfiguration: { useApifyProxy: true },
-            navigationTimeoutSecs: 60,
-            maxRequestRetries: 2,
-            maxRequestsPerCrawl: auctionUrls.length,
-            maxConcurrency: 2,
-          },
-          { timeout: 20000 }
-        );
-
-        const runId: string = runRes.data?.data?.id;
-        if (runId) {
-          for (let i = 0; i < 72; i++) { // up to 6 min
-            await sleep(5000);
-            const st = await axios.get(`https://api.apify.com/v2/actor-runs/${runId}?token=${config.apifyApiKey}`);
-            const s: string = st.data?.data?.status;
-            if (s === 'SUCCEEDED' || s === 'FAILED' || s === 'ABORTED') break;
-          }
-          const itemsRes = await axios.get(`https://api.apify.com/v2/actor-runs/${runId}/dataset/items?token=${config.apifyApiKey}`);
-          (itemsRes.data as { domain?: string; site?: string }[]).forEach(item => {
-            if (item.domain) {
-              discoveredDomains.push(item.domain);
-              const key = item.site === 'expireddomains' ? 'expireddomains:apify' : 'afternic:apify';
-              breakdown[key] = (breakdown[key] ?? 0) + 1;
-            }
+        const email = await extractBusinessEmail(biz.website!);
+        if (email && !seen.has(email)) {
+          seen.add(email);
+          breakdown['contact:emails']++;
+          allLeads.push({
+            name: biz.name ?? email.split('@')[0],
+            email,
+            company: biz.name,
+            source: 'apify:googlemaps',
+            raw_data: { website: biz.website, address: biz.address, source: 'google-maps-contact' },
           });
         }
-      } catch (e) {
-        errors['apify:auctions'] = (e as Error).message;
-        console.error('[Apify auctions]', (e as Error).message);
-      }
-    }
-
-    // ── Phase 2: Apollo reverse lookup on all discovered domains (cap 15) ──────
-    // organization_domains finds people whose company website IS that domain → potential buyers upgrading
-    const uniqueDomains = [...new Set(discoveredDomains)].slice(0, 15);
-    for (const domain of uniqueDomains) {
-      const leads = await apolloReverseFromDomain(domain, 'marketplace:apollo');
-      for (const l of leads) {
-        if (l.email && !seen.has(l.email)) { seen.add(l.email); allLeads.push(l); breakdown['apollo:reverse']++; }
-      }
-      await sleep(350);
-    }
-
-    // ── Phase 3: Apollo direct search — targeted queries from domain analysis ──
-    // This is the most reliable path: find founders/CMOs in relevant industries
-    if (config.apolloApiKey) {
-      const queries = analysis
-        ? await generateSearchQueries(asset, analysis)
-        : [{ titles: ['Founder', 'CEO', 'Co-Founder', 'CMO'], keywords: asset.domain.split('.')[0], seniority: ['founder', 'c_suite'] }];
-
-      for (const q of queries.slice(0, 3)) {
-        try {
-          const res = await axios.post(
-            'https://api.apollo.io/api/v1/mixed_people/api_search',
-            {
-              person_titles: q.titles,
-              person_seniority: q.seniority.length ? q.seniority : undefined,
-              q_keywords: q.keywords || undefined,
-              per_page: 25,
-              page: 1,
-            },
-            { headers: { 'Content-Type': 'application/json', 'X-Api-Key': config.apolloApiKey } }
-          );
-          const people: ApolloPersonResult[] = res.data?.people ?? [];
-          const withEmail = people.filter(p => p.email?.includes('@'));
-          const toReveal = people.filter(p => p.has_email && !p.email).slice(0, 15);
-          const revealed = toReveal.length ? await revealEmails(toReveal) : [];
-          for (const p of [...withEmail, ...revealed]) {
-            if (p.email && !seen.has(p.email)) {
-              seen.add(p.email);
-              allLeads.push({
-                name: [p.first_name, p.last_name].filter(Boolean).join(' '),
-                email: p.email,
-                company: p.organization?.name,
-                linkedin_url: p.linkedin_url,
-                source: `apollo:direct:${asset.domain}`,
-                raw_data: p,
-              });
-              breakdown['apollo:direct']++;
-            }
-          }
-        } catch (e) {
-          errors[`apollo:direct:${q.keywords}`] = (e as Error).message;
-        }
-        await sleep(400);
-      }
-
-      // ── Phase 3b: Apollo domain broker / investor search (always run) ────────
-      const brokerSearches = [
-        { titles: ['Domain Broker', 'Domain Advisor', 'Domain Investor'], keywords: '' },
-        { titles: ['Director', 'VP', 'Head'], keywords: 'domain acquisitions' },
-        { titles: ['Brand Strategist', 'Naming Consultant'], keywords: 'domain' },
-      ];
-      for (const s of brokerSearches) {
-        try {
-          const res = await axios.post(
-            'https://api.apollo.io/api/v1/mixed_people/api_search',
-            { person_titles: s.titles, q_keywords: s.keywords || undefined, per_page: 25, page: 1 },
-            { headers: { 'Content-Type': 'application/json', 'X-Api-Key': config.apolloApiKey } }
-          );
-          const people: ApolloPersonResult[] = res.data?.people ?? [];
-          const withEmail = people.filter(p => p.email?.includes('@'));
-          const toReveal = people.filter(p => p.has_email && !p.email).slice(0, 10);
-          const revealed = toReveal.length ? await revealEmails(toReveal) : [];
-          for (const p of [...withEmail, ...revealed]) {
-            if (p.email && !seen.has(p.email)) {
-              seen.add(p.email);
-              allLeads.push({ name: [p.first_name, p.last_name].filter(Boolean).join(' '), email: p.email, company: p.organization?.name, linkedin_url: p.linkedin_url, source: 'apollo:broker', raw_data: p });
-              breakdown['apollo:direct']++;
-            }
-          }
-        } catch (e) {
-          errors[`apollo:broker:${s.titles[0]}`] = (e as Error).message;
-        }
-        await sleep(500);
-      }
+      } catch { /* skip */ }
+      await sleep(600);
     }
   }
 

@@ -334,8 +334,8 @@ export default function Dashboard() {
             <div className="flex items-center gap-2">
               <span>⚡</span>
               <div className="text-left">
-                <p>Test Auctions + Apollo</p>
-                <p className="text-amber-600 font-normal text-xs">Sedo · Afternic · ExpiredDomains → Apollo</p>
+                <p>Apify: Maps + Contacts</p>
+                <p className="text-amber-600 font-normal text-xs">Google Maps → contact page → real emails</p>
               </div>
             </div>
             {running === 'test' && <span className="text-amber-300 text-xs animate-pulse ml-1">running</span>}
@@ -786,7 +786,7 @@ export default function Dashboard() {
             <div className="px-5 py-4 border-t border-gray-800 flex gap-3">
               <button onClick={confirmDomainPicker} disabled={pickerSelected.length === 0}
                 className="flex-1 py-2.5 rounded bg-blue-600 hover:bg-blue-500 disabled:opacity-40 text-white text-xs font-medium transition-colors">
-                Confirm — {pendingAction === 'all' ? 'Run All Steps' : pendingAction === 'test' ? 'Test Apify+Apollo' : pendingAction}
+                Confirm — {pendingAction === 'all' ? 'Run All Steps' : pendingAction === 'test' ? 'Apify: Maps + Contacts' : pendingAction}
               </button>
               <button onClick={() => { setShowDomainPicker(false); setPendingAction(null); }}
                 className="px-4 py-2.5 rounded border border-gray-700 hover:border-gray-500 text-gray-400 hover:text-white text-xs transition-colors">
