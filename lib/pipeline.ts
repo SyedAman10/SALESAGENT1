@@ -1630,7 +1630,13 @@ export interface DomainAnalysis {
 function loadPortfolio(targetDomains?: string[]): Asset[] {
   const p = path.join(process.cwd(), 'domains.json');
   const all: Asset[] = fs.existsSync(p) ? JSON.parse(fs.readFileSync(p, 'utf-8')) : [];
-  return targetDomains?.length ? all.filter(a => targetDomains.includes(a.domain)) : all;
+  if (!targetDomains?.length) return all;
+  const fromFile = all.filter(a => targetDomains.includes(a.domain));
+  const inFile = new Set(fromFile.map(a => a.domain));
+  const custom = targetDomains
+    .filter(d => !inFile.has(d))
+    .map(d => ({ domain: d, category: 'test', asking_price: 0, description: '' }));
+  return [...fromFile, ...custom];
 }
 
 export function getPortfolio(): Asset[] {
