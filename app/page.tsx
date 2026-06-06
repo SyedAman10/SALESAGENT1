@@ -864,36 +864,39 @@ export default function Dashboard() {
           )}
 
           {activeTab === 'emails' && (
-            <div className="flex gap-4 h-full">
-              <div className="w-80 space-y-2 overflow-auto flex-shrink-0">
+            <div className="flex flex-col md:flex-row gap-4 h-full">
+              <div className="md:w-80 w-full space-y-2 overflow-auto flex-shrink-0">
                 {emails.map(email => (
                   <button key={email.id} onClick={() => setSelectedEmail(email)}
-                    className={`w-full text-left bg-gray-900 border rounded-lg px-3 py-2.5 transition-colors ${selectedEmail?.id === email.id ? 'border-blue-500' : 'border-gray-800 hover:border-gray-600'}`}>
-                    <p className="text-white text-xs font-medium truncate">{email.name}</p>
-                    <p className="text-gray-500 text-xs truncate">{email.subject}</p>
-                    <div className="flex items-center gap-2 mt-1">
-                      <span className="text-blue-400 text-xs">{email.domain}</span>
-                      <span className="text-gray-600 text-xs">·</span>
-                      <span className="text-gray-500 text-xs">{email.variant}</span>
-                      <span className="text-gray-600 text-xs">·</span>
-                      <span className="text-gray-500 text-xs">score {email.score}</span>
+                    className={`w-full text-left bg-gray-900 border rounded-lg px-3 py-3 transition-colors ${selectedEmail?.id === email.id ? 'border-blue-500' : 'border-gray-800 hover:border-gray-600'}`}>
+                    <p className="text-white text-xs font-semibold truncate">{email.name}</p>
+                    <p className="text-gray-300 text-xs truncate mt-0.5">{email.subject}</p>
+                    <div className="flex items-center gap-2 mt-1.5 flex-wrap">
+                      <span className="text-blue-400 text-xs font-medium">{email.domain}</span>
+                      <span className="px-1.5 py-0.5 rounded bg-gray-700 text-gray-200 text-xs font-medium">{email.variant}</span>
+                      <span className="text-gray-400 text-xs">score {email.score}</span>
                     </div>
                   </button>
                 ))}
-                {emails.length === 0 && <p className="text-gray-600 text-xs text-center py-12">No approved emails yet.</p>}
+                {emails.length === 0 && <p className="text-gray-500 text-xs text-center py-12">No approved emails yet.</p>}
               </div>
 
               {selectedEmail ? (
                 <div className="flex-1 bg-gray-900 border border-gray-800 rounded-lg p-5 overflow-auto">
-                  <div className="mb-4 pb-4 border-b border-gray-800 space-y-1">
-                    <p className="text-gray-500 text-xs">To: <span className="text-white">{selectedEmail.name} &lt;{selectedEmail.email}&gt;</span></p>
-                    <p className="text-gray-500 text-xs">Subject: <span className="text-white">{selectedEmail.subject}</span></p>
-                    <p className="text-gray-500 text-xs">Domain: <span className="text-blue-400">{selectedEmail.domain}</span> · Variant: <span className="text-gray-300">{selectedEmail.variant}</span> · Score: <span className="text-gray-300">{selectedEmail.score}</span></p>
+                  <div className="mb-4 pb-4 border-b border-gray-800 space-y-1.5">
+                    <p className="text-gray-400 text-xs">To: <span className="text-white">{selectedEmail.name} &lt;{selectedEmail.email}&gt;</span></p>
+                    <p className="text-gray-400 text-xs">Subject: <span className="text-white">{selectedEmail.subject}</span></p>
+                    <div className="flex items-center gap-2 flex-wrap">
+                      <span className="text-gray-400 text-xs">Domain:</span>
+                      <span className="text-blue-400 text-xs font-medium">{selectedEmail.domain}</span>
+                      <span className="px-1.5 py-0.5 rounded bg-gray-700 text-gray-200 text-xs font-medium">{selectedEmail.variant}</span>
+                      <span className="text-gray-400 text-xs">score {selectedEmail.score}</span>
+                    </div>
                   </div>
-                  <pre className="text-gray-300 text-xs whitespace-pre-wrap leading-relaxed">{selectedEmail.body}</pre>
+                  <pre className="text-gray-200 text-xs whitespace-pre-wrap leading-relaxed">{selectedEmail.body}</pre>
                 </div>
               ) : (
-                <div className="flex-1 flex items-center justify-center text-gray-600 text-xs">Select an email to preview</div>
+                <div className="flex-1 flex items-center justify-center text-gray-500 text-xs">Select an email to preview</div>
               )}
             </div>
           )}
