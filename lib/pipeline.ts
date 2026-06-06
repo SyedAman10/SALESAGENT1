@@ -657,9 +657,19 @@ function isCorporateNonDomainLead(company?: string): boolean {
   return CORPORATE_BLOCKLIST.some(term => lower.includes(term));
 }
 
+const VALID_EMAIL_RE = /^[^\s@]+@[^\s@]+\.[a-zA-Z]{2,}$/;
+const FAKE_EMAIL_EXTS = new Set(['png','jpg','jpeg','gif','svg','webp','ico','bmp','pdf','zip','mp4','mp3','css','js','ts','tsx','jsx','json','xml','html','woff','ttf','eot','woff2','2x']);
+
+function isValidEmail(email: string): boolean {
+  if (!VALID_EMAIL_RE.test(email)) return false;
+  const tld = email.split('.').pop()?.toLowerCase() ?? '';
+  return !FAKE_EMAIL_EXTS.has(tld);
+}
+
 async function upsertLeads(leads: (RawLead & { source?: string })[]): Promise<{ inserted: number; skipped: number }> {
   let inserted = 0; let skipped = 0;
   for (const l of leads) {
+    if (!isValidEmail(l.email)) { skipped++; continue; }
     if (isCorporateNonDomainLead(l.company)) { skipped++; continue; }
     const rows = await sql`
       INSERT INTO leads (name, email, company, linkedin_url, source, raw_data, status)
@@ -1299,10 +1309,20 @@ async function getGoogleMapsBusinesses(analysis: DomainAnalysis): Promise<{ name
   }
 }
 
+const FILE_EXTS = new Set(['png','jpg','jpeg','gif','svg','webp','ico','bmp','pdf','zip','mp4','mp3','css','js','ts','tsx','jsx','json','xml','html','woff','ttf','eot','woff2']);
+
 async function extractBusinessEmail(websiteUrl: string): Promise<string | null> {
   const emailRegex = /[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}/g;
   const skipPrefixes = ['noreply', 'no-reply', 'donotreply', 'webmaster', 'postmaster'];
   const skipDomains = ['example.com', 'sentry.io', 'cloudflare.com', 'google.com', 'w3.org', 'schema.org', 'apple.com', 'wix.com', 'squarespace.com'];
+
+  function isRealEmail(e: string): boolean {
+    const tld = e.split('.').pop()?.toLowerCase() ?? '';
+    if (FILE_EXTS.has(tld)) return false;
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(e)) return false;
+    if (e.includes('..') || e.startsWith('.') || e.includes('@.')) return false;
+    return true;
+  }
   const domain = websiteUrl.replace(/^https?:\/\/(www\.)?/, '').split('/')[0].toLowerCase();
   const base = `https://${domain}`;
   for (const path of ['', '/contact', '/contact-us', '/about']) {
@@ -1314,6 +1334,7 @@ async function extractBusinessEmail(websiteUrl: string): Promise<string | null> 
       });
       const emails = (res.data as string).match(emailRegex) ?? [];
       const valid = emails.find(e =>
+        isRealEmail(e) &&
         !skipDomains.some(d => e.endsWith(`@${d}`)) &&
         !skipPrefixes.some(p => e.toLowerCase().startsWith(p))
       );
