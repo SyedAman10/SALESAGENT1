@@ -96,6 +96,8 @@ export default function Dashboard() {
   const [portfolio, setPortfolio] = useState<PortfolioDomain[]>([]);
   const [showDomainPicker, setShowDomainPicker] = useState(false);
   const [pickerSelected, setPickerSelected] = useState<string[]>([]);
+  const [pickerCustomInput, setPickerCustomInput] = useState('');
+  const [pickerCustomDomains, setPickerCustomDomains] = useState<string[]>([]);
   const [pendingAction, setPendingAction] = useState<PipelineStep | 'all' | null>(null);
   const [gmailAccount, setGmailAccount] = useState<string | null>(null);
   const [warmup, setWarmup] = useState<{
@@ -170,6 +172,8 @@ export default function Dashboard() {
 
   function openDomainPicker(action: PipelineStep | 'all') {
     setPickerSelected(portfolio.map(d => d.domain));
+    setPickerCustomDomains([]);
+    setPickerCustomInput('');
     setPendingAction(action);
     setShowDomainPicker(true);
   }
@@ -216,9 +220,11 @@ export default function Dashboard() {
 
   async function confirmDomainPicker() {
     const action = pendingAction;
-    const domains = pickerSelected;
+    const domains = [...new Set([...pickerSelected, ...pickerCustomDomains])];
     setShowDomainPicker(false);
     setPendingAction(null);
+    setPickerCustomDomains([]);
+    setPickerCustomInput('');
     if (!action) return;
     if (action === 'all') {
       await runAll(domains);
@@ -919,9 +925,42 @@ export default function Dashboard() {
                   {d.analysis && <span className="text-green-500 text-xs flex-shrink-0">analyzed</span>}
                 </label>
               ))}
+
+              {/* Custom / test domains */}
+              <div className="border-t border-gray-800 pt-3 mt-1">
+                <p className="text-gray-600 text-xs mb-2">Test with custom domain</p>
+                {pickerCustomDomains.map(d => (
+                  <div key={d} className="flex items-center justify-between px-3 py-1.5 mb-1 rounded border border-gray-700 bg-gray-800">
+                    <span className="text-yellow-400 text-xs">{d} <span className="text-gray-600">(test)</span></span>
+                    <button onClick={() => setPickerCustomDomains(prev => prev.filter(x => x !== d))}
+                      className="text-gray-600 hover:text-red-400 text-xs ml-2">✕</button>
+                  </div>
+                ))}
+                <div className="flex gap-2">
+                  <input
+                    type="text"
+                    placeholder="e.g. notion.com"
+                    value={pickerCustomInput}
+                    onChange={e => setPickerCustomInput(e.target.value)}
+                    onKeyDown={e => {
+                      if (e.key === 'Enter') {
+                        const v = pickerCustomInput.trim().toLowerCase().replace(/^https?:\/\//, '');
+                        if (v && !pickerCustomDomains.includes(v)) setPickerCustomDomains(prev => [...prev, v]);
+                        setPickerCustomInput('');
+                      }
+                    }}
+                    className="flex-1 bg-gray-900 border border-gray-700 rounded px-2 py-1.5 text-xs text-gray-300 placeholder-gray-700 focus:outline-none focus:border-gray-500"
+                  />
+                  <button onClick={() => {
+                    const v = pickerCustomInput.trim().toLowerCase().replace(/^https?:\/\//, '');
+                    if (v && !pickerCustomDomains.includes(v)) setPickerCustomDomains(prev => [...prev, v]);
+                    setPickerCustomInput('');
+                  }} className="px-3 py-1.5 bg-gray-700 hover:bg-gray-600 rounded text-xs text-white">Add</button>
+                </div>
+              </div>
             </div>
             <div className="px-5 py-4 border-t border-gray-800 flex gap-3">
-              <button onClick={confirmDomainPicker} disabled={pickerSelected.length === 0}
+              <button onClick={confirmDomainPicker} disabled={pickerSelected.length === 0 && pickerCustomDomains.length === 0}
                 className="flex-1 py-2.5 rounded bg-blue-600 hover:bg-blue-500 disabled:opacity-40 text-white text-xs font-medium transition-colors">
                 Confirm — {pendingAction === 'all' ? 'Run All Steps' : pendingAction === 'test' ? 'Apify: Maps + Contacts' : pendingAction}
               </button>
