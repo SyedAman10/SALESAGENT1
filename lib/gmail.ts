@@ -13,7 +13,7 @@ function oauthClient() {
   return new google.auth.OAuth2(
     config.googleClientId,
     config.googleClientSecret,
-    `${config.baseUrl}/api/auth/google/callback`,
+    `${config.baseUrl.replace(/\/$/, '')}/api/auth/google/callback`,
   );
 }
 

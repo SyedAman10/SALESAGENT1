@@ -4,13 +4,14 @@ import { config } from '@/lib/config';
 
 export async function GET(req: NextRequest) {
   const code = req.nextUrl.searchParams.get('code');
-  if (!code) return NextResponse.redirect(`${config.baseUrl}/?gmail=error`);
+  const base = config.baseUrl.replace(/\/$/, '');
+  if (!code) return NextResponse.redirect(`${base}/?gmail=error`);
 
   try {
     await handleOAuthCallback(code);
-    return NextResponse.redirect(`${config.baseUrl}/?gmail=connected`);
+    return NextResponse.redirect(`${base}/?gmail=connected`);
   } catch (e) {
     console.error('Gmail OAuth callback error:', e);
-    return NextResponse.redirect(`${config.baseUrl}/?gmail=error`);
+    return NextResponse.redirect(`${base}/?gmail=error`);
   }
 }
