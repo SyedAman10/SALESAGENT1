@@ -89,6 +89,26 @@ export default function Dashboard() {
   const [showDomainPicker, setShowDomainPicker] = useState(false);
   const [pickerSelected, setPickerSelected] = useState<string[]>([]);
   const [pendingAction, setPendingAction] = useState<PipelineStep | 'all' | null>(null);
+  const [gmailAccount, setGmailAccount] = useState<string | null>(null);
+  const [warmup, setWarmup] = useState<{
+    active: boolean; dayN: number; realLimit: number; warmupCount: number;
+    startedAt: string | null; sentToday: number; warmupSentToday: number;
+    seeds: string[]; complete: boolean;
+  } | null>(null);
+  const [warmupSeedInput, setWarmupSeedInput] = useState('');
+  const [warmupRunning, setWarmupRunning] = useState(false);
+  const [showWarmup, setShowWarmup] = useState(false);
+
+  const fetchGmailAccount = useCallback(async () => {
+    const res = await fetch('/api/gmail-account');
+    const data = await res.json() as { email: string | null };
+    setGmailAccount(data.email);
+  }, []);
+
+  const fetchWarmup = useCallback(async () => {
+    const res = await fetch('/api/warmup');
+    setWarmup(await res.json());
+  }, []);
 
   const fetchStats = useCallback(async () => {
     const res = await fetch('/api/stats');
@@ -122,7 +142,18 @@ export default function Dashboard() {
     fetchEmails();
     fetchSentEmails();
     fetchPortfolio();
-  }, [fetchStats, fetchLeads, fetchEmails, fetchSentEmails, fetchPortfolio]);
+    fetchGmailAccount();
+    fetchWarmup();
+  }, [fetchStats, fetchLeads, fetchEmails, fetchSentEmails, fetchPortfolio, fetchGmailAccount, fetchWarmup]);
+
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const gmail = params.get('gmail');
+    if (gmail === 'connected' || gmail === 'error') {
+      fetchGmailAccount();
+      window.history.replaceState({}, '', '/');
+    }
+  }, [fetchGmailAccount]);
 
   const DOMAIN_PICKER_STEPS = new Set<PipelineStep | 'all'>(['analyze', 'ingest', 'match', 'all', 'test', 'hot', 'testnew']);
 
@@ -291,8 +322,8 @@ export default function Dashboard() {
             <div className="flex items-center gap-2">
               <span>🧪</span>
               <div className="text-left">
-                <p>Test NameBio + Industry</p>
-                <p className="text-cyan-600 font-normal text-xs">NameBio recent sales · Apollo org-keywords</p>
+                <p>Test Buyer-Type Apollo</p>
+                <p className="text-cyan-600 font-normal text-xs">Founders/owners matching domain buyer profiles</p>
               </div>
             </div>
             {running === 'testnew' && <span className="text-cyan-300 text-xs animate-pulse ml-1">running</span>}
@@ -316,12 +347,136 @@ export default function Dashboard() {
           </button>
 
           <div className="border-t border-gray-800 pt-3 mt-1">
-            <button onClick={confirmAndSend} disabled={!!running || sending || (stats?.approved ?? 0) === 0}
+            {gmailAccount ? (
+              <div className="mb-2">
+                <div className="flex items-center justify-between px-3 py-2 rounded bg-gray-900 border border-gray-700">
+                  <div>
+                    <p className="text-green-400 text-xs font-medium">Gmail connected</p>
+                    <p className="text-gray-500 text-xs truncate max-w-[140px]">{gmailAccount}</p>
+                  </div>
+                  <button
+                    onClick={async () => { await fetch('/api/gmail-account', { method: 'DELETE' }); setGmailAccount(null); }}
+                    className="text-gray-600 hover:text-red-400 text-xs ml-2"
+                  >disconnect</button>
+                </div>
+              </div>
+            ) : (
+              <a href="/api/auth/google"
+                className="block w-full px-3 py-2.5 rounded border border-gray-600 hover:border-gray-400 text-center text-gray-300 text-xs font-medium transition-colors mb-2">
+                Connect Gmail to send
+              </a>
+            )}
+            <button onClick={confirmAndSend} disabled={!!running || sending || (stats?.approved ?? 0) === 0 || !gmailAccount}
               className="w-full px-3 py-2.5 rounded bg-green-700 hover:bg-green-600 disabled:opacity-40 text-white text-xs font-medium transition-colors">
               {sending ? 'Sending...' : `Send ${stats?.approved ?? 0} Approved Email${(stats?.approved ?? 0) !== 1 ? 's' : ''}`}
             </button>
             <p className="text-gray-600 text-xs mt-1.5 text-center">{stats?.sentToday ?? 0} / {stats?.dailyLimit ?? 50} sent today</p>
             <p className="text-gray-700 text-xs mt-1 text-center">⏱ auto-runs daily 9am UTC</p>
+          </div>
+
+          {/* Warmup */}
+          <div className="border-t border-gray-800 pt-3 mt-1">
+            <button onClick={() => setShowWarmup(v => !v)} className="flex items-center justify-between w-full text-gray-500 text-xs uppercase tracking-wider mb-2 hover:text-gray-300">
+              <span>Email Warmup</span>
+              <span className={warmup?.active && !warmup.complete ? 'text-green-500' : warmup?.complete ? 'text-blue-400' : 'text-gray-600'}>
+                {warmup?.active && !warmup.complete ? `Day ${warmup.dayN}/28` : warmup?.complete ? 'Complete' : 'Off'}
+              </span>
+            </button>
+            {showWarmup && warmup && (
+              <div className="space-y-2 mb-2">
+                {warmup.active && !warmup.complete && (
+                  <div className="bg-gray-900 border border-gray-700 rounded px-3 py-2 space-y-1">
+                    <div className="flex justify-between text-xs">
+                      <span className="text-gray-500">Day</span>
+                      <span className="text-white">{warmup.dayN} / 28</span>
+                    </div>
+                    <div className="flex justify-between text-xs">
+                      <span className="text-gray-500">Real send limit</span>
+                      <span className="text-yellow-400">{warmup.realLimit}/day</span>
+                    </div>
+                    <div className="flex justify-between text-xs">
+                      <span className="text-gray-500">Warmup emails today</span>
+                      <span className="text-green-400">{warmup.warmupSentToday} / {warmup.warmupCount}</span>
+                    </div>
+                    <div className="w-full bg-gray-800 rounded-full h-1 mt-1">
+                      <div className="bg-green-500 h-1 rounded-full" style={{ width: `${(warmup.dayN / 28) * 100}%` }} />
+                    </div>
+                  </div>
+                )}
+                {warmup.complete && (
+                  <p className="text-blue-400 text-xs px-1">Warmup done — sending at full limit.</p>
+                )}
+                {!warmup.active && (
+                  <p className="text-gray-600 text-xs px-1">Not active. Add seeds then start.</p>
+                )}
+
+                {/* Seeds */}
+                <div className="space-y-1">
+                  <p className="text-gray-600 text-xs px-1">Seeds ({warmup.seeds.length})</p>
+                  {warmup.seeds.map(seed => (
+                    <div key={seed} className="flex items-center justify-between px-2 py-1 bg-gray-900 rounded text-xs">
+                      <span className="text-gray-400 truncate">{seed}</span>
+                      <button onClick={async () => {
+                        await fetch('/api/warmup', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'remove-seed', email: seed }) });
+                        fetchWarmup();
+                      }} className="text-gray-700 hover:text-red-400 ml-2 flex-shrink-0">✕</button>
+                    </div>
+                  ))}
+                  <div className="flex gap-1">
+                    <input
+                      type="email"
+                      placeholder="add seed email"
+                      value={warmupSeedInput}
+                      onChange={e => setWarmupSeedInput(e.target.value)}
+                      onKeyDown={async e => {
+                        if (e.key === 'Enter' && warmupSeedInput.trim()) {
+                          await fetch('/api/warmup', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'add-seed', email: warmupSeedInput.trim() }) });
+                          setWarmupSeedInput('');
+                          fetchWarmup();
+                        }
+                      }}
+                      className="flex-1 bg-gray-900 border border-gray-700 rounded px-2 py-1 text-xs text-gray-300 placeholder-gray-700 focus:outline-none focus:border-gray-500"
+                    />
+                    <button onClick={async () => {
+                      if (!warmupSeedInput.trim()) return;
+                      await fetch('/api/warmup', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'add-seed', email: warmupSeedInput.trim() }) });
+                      setWarmupSeedInput('');
+                      fetchWarmup();
+                    }} className="px-2 py-1 bg-gray-700 hover:bg-gray-600 rounded text-xs text-white">+</button>
+                  </div>
+                </div>
+
+                {/* Actions */}
+                <div className="flex gap-1.5">
+                  {!warmup.active ? (
+                    <button onClick={async () => {
+                      if (warmup.seeds.length === 0) { alert('Add at least one seed email first.'); return; }
+                      await fetch('/api/warmup', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'start' }) });
+                      fetchWarmup();
+                    }} className="flex-1 py-1.5 rounded bg-green-800 hover:bg-green-700 text-white text-xs">Start warmup</button>
+                  ) : (
+                    <>
+                      {!warmup.complete && (
+                        <button disabled={warmupRunning || warmup.warmupSentToday >= warmup.warmupCount} onClick={async () => {
+                          setWarmupRunning(true);
+                          const res = await fetch('/api/warmup', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'send' }) });
+                          const data = await res.json() as { sent: number; errors: string[] };
+                          setLog(prev => [...prev, `Warmup: sent ${data.sent} emails${data.errors.length ? ` (${data.errors.length} errors)` : ''}`]);
+                          fetchWarmup();
+                          setWarmupRunning(false);
+                        }} className="flex-1 py-1.5 rounded bg-blue-800 hover:bg-blue-700 disabled:opacity-40 text-white text-xs">
+                          {warmupRunning ? 'Sending...' : `Send warmup (${warmup.warmupCount - warmup.warmupSentToday} left)`}
+                        </button>
+                      )}
+                      <button onClick={async () => {
+                        await fetch('/api/warmup', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'stop' }) });
+                        fetchWarmup();
+                      }} className="px-2.5 py-1.5 rounded border border-gray-700 hover:border-red-700 text-gray-500 hover:text-red-400 text-xs">Stop</button>
+                    </>
+                  )}
+                </div>
+              </div>
+            )}
           </div>
 
           {log.length > 0 && (

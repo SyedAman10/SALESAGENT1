@@ -1,7 +1,8 @@
 import Anthropic from '@anthropic-ai/sdk';
 import axios from 'axios';
 import * as cheerio from 'cheerio';
-import nodemailer from 'nodemailer';
+import { sendViaGmail } from './gmail';
+import { getEffectiveDailyLimit } from './warmup';
 import fs from 'fs';
 import path from 'path';
 import { sql } from './db';
@@ -126,40 +127,33 @@ async function fetchDomainSpecificLeads(asset: Asset, analysis: DomainAnalysis):
     await sleep(400);
   }
 
-  // Industry searches — requires domain root keyword + industry term to match together
-  // Filters results to companies whose name/domain actually contains the root keyword
-  const root = asset.domain.split('.')[0];
-  const rootParts = root.match(/[a-z]{3,}/gi) ?? [root];
-  for (const industry of analysis.industries.slice(0, 3)) {
-    for (const kw of rootParts.slice(0, 2)) {
-      try {
-        const res = await axios.post(
-          'https://api.apollo.io/api/v1/mixed_people/api_search',
-          {
-            q_keywords: `${kw} ${industry}`,
-            person_seniority: ['owner', 'founder', 'c_suite'],
-            organization_num_employees_ranges: ['1,10', '11,50', '51,200'],
-            per_page: 25,
-            page: 1,
-          },
-          { headers: { 'Content-Type': 'application/json', 'X-Api-Key': config.apolloApiKey } }
-        );
-        const people: ApolloPersonResult[] = res.data?.people ?? [];
-        // Keep only people whose company name or domain actually contains our keyword
-        const relevant = people.filter(p => {
-          const co = (p.organization?.name ?? '').toLowerCase();
-          const dom = (p.organization?.primary_domain ?? '').toLowerCase();
-          return co.includes(kw) || dom.includes(kw);
-        });
-        const withEmail = relevant.filter(p => p.email?.includes('@'));
-        const toReveal = relevant.filter(p => p.has_email && !p.email).slice(0, 6);
-        const revealed = toReveal.length ? await revealEmails(toReveal) : [];
-        for (const p of [...withEmail, ...revealed].filter(p => p.email)) {
-          leads.push({ name: [p.first_name, p.last_name].filter(Boolean).join(' '), email: p.email!, company: p.organization?.name, linkedin_url: p.linkedin_url, source: `apollo:${asset.domain}-industry`, raw_data: { keyword: kw, industry, title: p.title, companyDomain: p.organization?.primary_domain } });
-        }
-      } catch { /* continue */ }
-      await sleep(400);
-    }
+  // Buyer-type searches — use ideal_buyer_types as q_keywords + owner/founder titles
+  // Much more targeted than industry-only: "wellness fitness club founder" vs "wellness"
+  const endUserBuyerTypes = analysis.ideal_buyer_types.filter(t =>
+    !t.toLowerCase().includes('domain investor') && !t.toLowerCase().includes('broker') && !t.toLowerCase().includes('resale')
+  ).slice(0, 4);
+  for (const buyerType of endUserBuyerTypes) {
+    try {
+      const res = await axios.post(
+        'https://api.apollo.io/api/v1/mixed_people/api_search',
+        {
+          person_titles: ['Founder', 'Co-Founder', 'Owner', 'CEO', 'President'],
+          q_keywords: buyerType,
+          organization_num_employees_ranges: ['1,10', '11,50'],
+          per_page: 20,
+          page: 1,
+        },
+        { headers: { 'Content-Type': 'application/json', 'X-Api-Key': config.apolloApiKey } }
+      );
+      const people: ApolloPersonResult[] = res.data?.people ?? [];
+      const withEmail = people.filter(p => p.email?.includes('@'));
+      const toReveal = people.filter(p => p.has_email && !p.email).slice(0, 6);
+      const revealed = toReveal.length ? await revealEmails(toReveal) : [];
+      for (const p of [...withEmail, ...revealed].filter(p => p.email)) {
+        leads.push({ name: [p.first_name, p.last_name].filter(Boolean).join(' '), email: p.email!, company: p.organization?.name, linkedin_url: p.linkedin_url, source: `apollo:${asset.domain}-industry`, raw_data: { buyerType, title: p.title, companyDomain: p.organization?.primary_domain } });
+      }
+    } catch { /* continue */ }
+    await sleep(400);
   }
 
   return leads;
@@ -170,11 +164,10 @@ async function fetchDomainSpecificLeads(asset: Asset, analysis: DomainAnalysis):
 // Master coordinator: runs all market sources for a single domain in parallel
 async function scrapeAllMarketSources(asset: Asset, analysis: DomainAnalysis): Promise<RawLead[]> {
   const results = await Promise.allSettled([
-    fetchDomainSpecificLeads(asset, analysis),     // Apollo: targeted end-user buyers + industry org search
+    fetchDomainSpecificLeads(asset, analysis),     // Apollo: targeted end-user buyers + buyer-type searches
     scrapeNameprosWanted(analysis),                // Namepros "Buy" section: explicit intent
     scrapeGoDaddyAuctions(asset, analysis),        // GoDaddy Auctions: active domain buyers
     scrapeAfternicSedo(asset, analysis),           // Afternic/Sedo: similar domain sellers → Apollo
-    scrapeNameBio(asset),                          // NameBio recent sales → Apollo org lookup (no Apify)
   ]);
   const leads: RawLead[] = [];
   for (const r of results) {
@@ -334,58 +327,6 @@ async function scrapeAfternicSedo(asset: Asset, analysis: DomainAnalysis): Promi
   return leads;
 }
 
-// NameBio recent sales → Apollo org-domain lookup
-// Finds founders/owners at companies that recently bought a similar-category domain (proven buyers)
-// Uses direct HTTP scrape — no Apify
-async function scrapeNameBio(asset: Asset): Promise<RawLead[]> {
-  if (!config.apolloApiKey) return [];
-  const leads: RawLead[] = [];
-  const root = asset.domain.split('.')[0]; // "indikaclub"
-  // extract sub-keywords from compound domain: "indikaclub" → ["indika", "club"]
-  const parts = root.match(/[a-z]{3,}/gi) ?? [];
-  const kws = [...new Set([root, ...parts])].slice(0, 2);
-  const seenDomains = new Set<string>();
-
-  for (const kw of kws) {
-    try {
-      const res = await axios.get(`https://namebio.com/?s=${encodeURIComponent(kw)}`, {
-        headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36', Accept: 'text/html,application/xhtml+xml' },
-        timeout: 12000,
-      });
-      const $ = cheerio.load(res.data as string);
-      const soldDomains: string[] = [];
-
-      $('table tr, .nb-results tr, [class*="sale"] tr').each((_, row) => {
-        const cells = $(row).find('td');
-        if (cells.length < 2) return;
-        const txt = $(cells[0]).text().trim().toLowerCase().replace(/\s/g, '');
-        if (/^[a-z0-9][a-z0-9-]{1,40}\.[a-z]{2,6}$/.test(txt) && !seenDomains.has(txt) && !txt.includes('namebio')) {
-          soldDomains.push(txt);
-          seenDomains.add(txt);
-        }
-      });
-
-      if (soldDomains.length === 0) continue;
-
-      // Batch Apollo org-domain lookup — find founders/CEOs at companies using those domains
-      const batch = soldDomains.slice(0, 15);
-      const aRes = await axios.post(
-        'https://api.apollo.io/api/v1/mixed_people/api_search',
-        { organization_domains: batch, person_seniority: ['owner', 'founder', 'c_suite'], per_page: 25, page: 1 },
-        { headers: { 'Content-Type': 'application/json', 'X-Api-Key': config.apolloApiKey } }
-      );
-      const people: ApolloPersonResult[] = aRes.data?.people ?? [];
-      const withEmail = people.filter(p => p.email?.includes('@'));
-      const toReveal = people.filter(p => p.has_email && !p.email).slice(0, 8);
-      const revealed = toReveal.length ? await revealEmails(toReveal) : [];
-      for (const p of [...withEmail, ...revealed].filter(p => p.email)) {
-        leads.push({ name: [p.first_name, p.last_name].filter(Boolean).join(' '), email: p.email!, company: p.organization?.name, linkedin_url: p.linkedin_url, source: `namebio:${kw}`, raw_data: { keyword: kw, targetDomain: asset.domain, companyDomain: p.organization?.primary_domain } });
-      }
-    } catch { /* continue */ }
-    await sleep(700);
-  }
-  return leads;
-}
 
 // Convert a discovered auction domain → find decision-makers at that company via Apollo
 // e.g. "lumisgroup.com" → search "Lumis Group" → get founders/CEOs who may be domain buyers
@@ -1236,47 +1177,33 @@ export async function testNewSources(targetDomains?: string[]): Promise<{ insert
   for (const asset of portfolio) {
     const analysis = await getDomainAnalysis(asset.domain);
 
-    // NameBio
-    try {
-      const namebioLeads = await scrapeNameBio(asset);
-      for (const l of namebioLeads) {
-        if (l.email && l.source && !seen.has(l.email)) { seen.add(l.email); allLeads.push(l); breakdown[l.source] = (breakdown[l.source] ?? 0) + 1; }
-      }
-    } catch (e) { errors[`namebio:${asset.domain}`] = (e as Error).message; }
-
     if (!analysis) { errors[`apollo-industry:${asset.domain}`] = 'no analysis — run Analyze first'; continue; }
 
-    // Apollo industry search — requires domain root keyword + industry together, filters by company relevance
-    const assetRoot = asset.domain.split('.')[0];
-    const assetParts = assetRoot.match(/[a-z]{3,}/gi) ?? [assetRoot];
-    for (const industry of analysis.industries.slice(0, 3)) {
-      for (const kw of assetParts.slice(0, 2)) {
-        try {
-          const res = await axios.post(
-            'https://api.apollo.io/api/v1/mixed_people/api_search',
-            { q_keywords: `${kw} ${industry}`, person_seniority: ['owner', 'founder', 'c_suite'], organization_num_employees_ranges: ['1,10', '11,50', '51,200'], per_page: 25, page: 1 },
-            { headers: { 'Content-Type': 'application/json', 'X-Api-Key': config.apolloApiKey } }
-          );
-          const people: ApolloPersonResult[] = res.data?.people ?? [];
-          const relevant = people.filter(p => {
-            const co = (p.organization?.name ?? '').toLowerCase();
-            const dom = (p.organization?.primary_domain ?? '').toLowerCase();
-            return co.includes(kw) || dom.includes(kw);
-          });
-          const withEmail = relevant.filter(p => p.email?.includes('@'));
-          const toReveal = relevant.filter(p => p.has_email && !p.email).slice(0, 6);
-          const revealed = toReveal.length ? await revealEmails(toReveal) : [];
-          for (const p of [...withEmail, ...revealed].filter(p => p.email)) {
-            if (!seen.has(p.email!)) {
-              seen.add(p.email!);
-              const src = `apollo:${asset.domain}-industry`;
-              breakdown[src] = (breakdown[src] ?? 0) + 1;
-              allLeads.push({ name: [p.first_name, p.last_name].filter(Boolean).join(' '), email: p.email!, company: p.organization?.name, linkedin_url: p.linkedin_url, source: src, raw_data: { keyword: kw, industry, title: p.title } });
-            }
+    // Apollo buyer-type search — ideal_buyer_types as q_keywords + owner/founder titles
+    const endUserBuyerTypes = analysis.ideal_buyer_types.filter(t =>
+      !t.toLowerCase().includes('domain investor') && !t.toLowerCase().includes('broker') && !t.toLowerCase().includes('resale')
+    ).slice(0, 4);
+    for (const buyerType of endUserBuyerTypes) {
+      try {
+        const res = await axios.post(
+          'https://api.apollo.io/api/v1/mixed_people/api_search',
+          { person_titles: ['Founder', 'Co-Founder', 'Owner', 'CEO', 'President'], q_keywords: buyerType, organization_num_employees_ranges: ['1,10', '11,50'], per_page: 20, page: 1 },
+          { headers: { 'Content-Type': 'application/json', 'X-Api-Key': config.apolloApiKey } }
+        );
+        const people: ApolloPersonResult[] = res.data?.people ?? [];
+        const withEmail = people.filter(p => p.email?.includes('@'));
+        const toReveal = people.filter(p => p.has_email && !p.email).slice(0, 6);
+        const revealed = toReveal.length ? await revealEmails(toReveal) : [];
+        for (const p of [...withEmail, ...revealed].filter(p => p.email)) {
+          if (!seen.has(p.email!)) {
+            seen.add(p.email!);
+            const src = `apollo:${asset.domain}-industry`;
+            breakdown[src] = (breakdown[src] ?? 0) + 1;
+            allLeads.push({ name: [p.first_name, p.last_name].filter(Boolean).join(' '), email: p.email!, company: p.organization?.name, linkedin_url: p.linkedin_url, source: src, raw_data: { buyerType, title: p.title } });
           }
-        } catch (e) { errors[`apollo-industry:${kw}:${industry}`] = (e as Error).message; }
-        await sleep(400);
-      }
+        }
+      } catch (e) { errors[`apollo-industry:${buyerType}`] = (e as Error).message; }
+      await sleep(400);
     }
   }
 
@@ -1917,8 +1844,6 @@ async function pickVariant(enrichment: LeadEnrichment, variants: { id: number; s
 // ── SEND ──────────────────────────────────────────────────────────────────────
 
 export async function sendApproved(): Promise<{ sent: number; failed: number }> {
-  const transport = nodemailer.createTransport({ host: config.smtp.host, port: config.smtp.port, secure: config.smtp.port === 465, auth: { user: config.smtp.user, pass: config.smtp.pass } });
-
   const sentTodayRows = await sql`SELECT COUNT(*) as c FROM send_log WHERE sent_at::date = CURRENT_DATE`;
   const sentToday = Number((sentTodayRows[0] as { c: string | number }).c ?? 0);
   const remaining = config.dailySendLimit - sentToday;
@@ -1955,7 +1880,7 @@ export async function sendApproved(): Promise<{ sent: number; failed: number }> 
     const lead = leadRows[0] as { name: string; email: string };
     const bodyWithFooter = `${email.body}\n\n---\nTo unsubscribe: ${config.baseUrl}/api/unsubscribe?email=${encodeURIComponent(lead.email)}`;
     try {
-      await transport.sendMail({ from: `"${config.fromName}" <${config.fromEmail}>`, to: lead.email, bcc: config.fromEmail, subject: email.subject, text: bodyWithFooter });
+      await sendViaGmail({ to: lead.email, subject: email.subject, body: bodyWithFooter });
       await sql`UPDATE emails SET status = 'sent', sent_at = NOW() WHERE id = ${email.id}`;
       if (email.sequence_day === 1) await sql`UPDATE leads SET status = 'contacted' WHERE id = ${email.lead_id}`;
       await sql`INSERT INTO send_log (email_id, result) VALUES (${email.id}, 'ok')`;
@@ -1974,18 +1899,13 @@ export async function sendApproved(): Promise<{ sent: number; failed: number }> 
 type Emitter = (data: object) => void;
 
 export async function sendApprovedStream(emit: Emitter): Promise<void> {
-  const transport = nodemailer.createTransport({
-    host: config.smtp.host, port: config.smtp.port,
-    secure: config.smtp.port === 465,
-    auth: { user: config.smtp.user, pass: config.smtp.pass },
-  });
-
   const sentTodayRows = await sql`SELECT COUNT(*) as c FROM send_log WHERE sent_at::date = CURRENT_DATE`;
   const sentToday = Number((sentTodayRows[0] as { c: string | number }).c ?? 0);
-  const remaining = config.dailySendLimit - sentToday;
+  const dailyLimit = await getEffectiveDailyLimit();
+  const remaining = dailyLimit - sentToday;
 
   if (remaining <= 0) {
-    emit({ type: 'log', message: `Daily limit of ${config.dailySendLimit} already reached.` });
+    emit({ type: 'log', message: `Daily limit of ${dailyLimit} already reached.` });
     return;
   }
 
@@ -2014,7 +1934,7 @@ export async function sendApprovedStream(emit: Emitter): Promise<void> {
 
   const queue = [...day1, ...dueFollowUps].slice(0, remaining);
 
-  emit({ type: 'log', message: `Sending ${queue.length} emails (${day1.length} new + ${dueFollowUps.length} follow-ups due, limit: ${remaining} remaining today)` });
+  emit({ type: 'log', message: `Sending ${queue.length} emails (${day1.length} new + ${dueFollowUps.length} follow-ups due, limit: ${dailyLimit} — ${remaining} remaining today)` });
 
   let sent = 0; let failed = 0;
 
@@ -2024,7 +1944,7 @@ export async function sendApprovedStream(emit: Emitter): Promise<void> {
     const label = email.sequence_day > 1 ? `Day ${email.sequence_day} follow-up` : 'Day 1';
     const bodyWithFooter = `${email.body}\n\n---\nTo unsubscribe: ${config.baseUrl}/api/unsubscribe?email=${encodeURIComponent(lead.email)}`;
     try {
-      await transport.sendMail({ from: `"${config.fromName}" <${config.fromEmail}>`, to: lead.email, bcc: config.fromEmail, subject: email.subject, text: bodyWithFooter });
+      await sendViaGmail({ to: lead.email, subject: email.subject, body: bodyWithFooter });
       await sql`UPDATE emails SET status = 'sent', sent_at = NOW() WHERE id = ${email.id}`;
       if (email.sequence_day === 1) await sql`UPDATE leads SET status = 'contacted' WHERE id = ${email.lead_id}`;
       await sql`INSERT INTO send_log (email_id, result) VALUES (${email.id}, 'ok')`;

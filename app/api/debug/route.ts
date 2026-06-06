@@ -144,9 +144,8 @@ export async function GET() {
     apollo_key_prefix: config.apolloApiKey?.slice(0, 6) + '...',
     apify_key_set: !!config.apifyApiKey,
     anthropic_key_set: !!config.anthropicApiKey,
-    smtp_host: config.smtp.host,
-    smtp_user: config.smtp.user,
-    from_email: config.fromEmail,
+    google_client_id_set: !!config.googleClientId,
+    from_name: config.fromName,
   };
 
   return NextResponse.json(results, { status: 200 });

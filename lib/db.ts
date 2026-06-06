@@ -63,4 +63,28 @@ export async function initDb(): Promise<void> {
     sent_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     result TEXT NOT NULL
   )`;
+  await db`CREATE TABLE IF NOT EXISTS gmail_accounts (
+    id SERIAL PRIMARY KEY,
+    email TEXT NOT NULL UNIQUE,
+    access_token TEXT,
+    refresh_token TEXT NOT NULL,
+    token_expiry TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  )`;
+  await db`CREATE TABLE IF NOT EXISTS warmup_config (
+    id SERIAL PRIMARY KEY,
+    started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    is_active BOOLEAN NOT NULL DEFAULT true
+  )`;
+  await db`CREATE TABLE IF NOT EXISTS warmup_seeds (
+    id SERIAL PRIMARY KEY,
+    email TEXT NOT NULL UNIQUE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  )`;
+  await db`CREATE TABLE IF NOT EXISTS warmup_sends (
+    id SERIAL PRIMARY KEY,
+    seed_email TEXT NOT NULL,
+    sent_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    subject TEXT NOT NULL
+  )`;
 }
