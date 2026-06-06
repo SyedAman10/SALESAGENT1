@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { ingestLeads, enrichLeads, matchDomains, writeEmails, decideAndApprove, analyzeDomains, writeFollowUps, testApifyApollo, findHotLeads, testNewSources, findUpgradeBuyers } from '@/lib/pipeline';
+import { ingestLeads, enrichLeads, matchDomains, writeEmails, decideAndApprove, analyzeDomains, writeFollowUps, testApifyApollo, findHotLeads, testNewSources, findUpgradeBuyers, findCompanyNameMatches } from '@/lib/pipeline';
 
 export const maxDuration = 300;
 
@@ -47,6 +47,16 @@ export async function POST(req: NextRequest) {
           threads: result.threads,
           ...result.sources,
           ...(hasErrors ? { errors: result.errors } : {}),
+        });
+      }
+      case 'namematch': {
+        const result = await findCompanyNameMatches(domains);
+        return NextResponse.json({
+          ok: true,
+          inserted: result.inserted,
+          skipped: result.skipped,
+          ...result.breakdown,
+          ...(Object.keys(result.errors).length ? { errors: result.errors } : {}),
         });
       }
       case 'upgrade': {

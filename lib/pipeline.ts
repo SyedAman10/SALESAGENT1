@@ -1463,6 +1463,85 @@ export async function findUpgradeBuyers(targetDomains?: string[]): Promise<{
   return { inserted, skipped, liveVariants, breakdown, errors };
 }
 
+// ── COMPANY NAME MATCH ────────────────────────────────────────────────────────
+// Finds companies whose actual name contains the domain keywords.
+// e.g. "Indika Wellness", "Indika Social Club", "Club Indika" — these businesses
+// already have this brand identity and are natural buyers for the .com.
+
+export async function findCompanyNameMatches(targetDomains?: string[]): Promise<{
+  inserted: number; skipped: number;
+  breakdown: Record<string, number>; errors: Record<string, string>;
+}> {
+  if (!config.apolloApiKey) return { inserted: 0, skipped: 0, breakdown: {}, errors: { apollo: 'No Apollo key' } };
+
+  const portfolio = loadPortfolio(targetDomains);
+  const allLeads: RawLead[] = [];
+  const seen = new Set<string>();
+  const breakdown: Record<string, number> = {};
+  const errors: Record<string, string> = {};
+
+  for (const asset of portfolio) {
+    // Extract meaningful keywords from the domain name
+    // e.g. "indikaclub.com" → ["indika", "club", "indika club"]
+    const baseName = asset.domain.replace(/\.(com|net|org|io|co|club|app|us|biz|info)$/i, '');
+    const words = baseName.replace(/([a-z])([A-Z])/g, '$1 $2').replace(/[-_]/g, ' ').toLowerCase().split(' ').filter(w => w.length > 2);
+    const queries = [...new Set([baseName, ...words, words.join(' ')])].filter(Boolean);
+
+    for (const q of queries) {
+      for (let page = 1; page <= 2; page++) {
+        try {
+          const res = await axios.post(
+            'https://api.apollo.io/api/v1/mixed_people/api_search',
+            {
+              q_organization_name: q,
+              person_seniority: ['owner', 'founder', 'c_suite', 'partner', 'vp', 'head', 'director'],
+              per_page: 25,
+              page,
+            },
+            { headers: { 'Content-Type': 'application/json', 'X-Api-Key': config.apolloApiKey } }
+          );
+          const people: ApolloPersonResult[] = res.data?.people ?? [];
+          if (people.length === 0) break;
+
+          const withEmail = people.filter(p => p.email?.includes('@'));
+          const toReveal = people.filter(p => p.has_email && !p.email).slice(0, 8);
+          const revealed = toReveal.length ? await revealEmails(toReveal) : [];
+          const found = [...withEmail, ...revealed].filter(p => p.email);
+
+          if (page === 1 && people.length > 0 && found.length === 0) {
+            errors[`reveal:${q}`] = `${people.length} found, 0 emails — upgrade Apollo plan`;
+          }
+
+          for (const p of found) {
+            if (!seen.has(p.email!)) {
+              seen.add(p.email!);
+              const src = `namematch:${asset.domain}`;
+              breakdown[src] = (breakdown[src] ?? 0) + 1;
+              allLeads.push({
+                name: [p.first_name, p.last_name].filter(Boolean).join(' '),
+                email: p.email!,
+                company: p.organization?.name,
+                linkedin_url: p.linkedin_url,
+                source: 'namematch:buyer',
+                raw_data: {
+                  matched_query: q,
+                  company: p.organization?.name,
+                  domain_for_sale: asset.domain,
+                  title: p.title,
+                },
+              });
+            }
+          }
+        } catch (e) { errors[`apollo:${q}:p${page}`] = (e as Error).message; break; }
+        await sleep(500);
+      }
+    }
+  }
+
+  const { inserted, skipped } = await upsertLeads(allLeads);
+  return { inserted, skipped, breakdown, errors };
+}
+
 // ── ENRICH ────────────────────────────────────────────────────────────────────
 
 export interface LeadEnrichment {
@@ -1771,8 +1850,11 @@ Domain:
   let rawData: Record<string, string> = {};
   try { rawData = JSON.parse(lead.raw_data ?? '{}') as Record<string, string>; } catch { /* ok */ }
   const isUpgradeBuyer = lead.source === 'upgrade:buyer' && rawData.upgrade_from;
+  const isNameMatch = lead.source === 'namematch:buyer' && rawData.company;
   const upgradeContext = isUpgradeBuyer
-    ? `\nUPGRADE BUYER: This person is currently using ${rawData.upgrade_from} — they already have this exact brand, just on a weaker TLD. Lead with this: "I noticed you're running [their business] on ${rawData.upgrade_from} — I own ${rawData.upgrade_to} and thought you might want the .com." This is NOT a cold pitch — they already invested in this brand.`
+    ? `\nUPGRADE BUYER: This person is currently using ${rawData.upgrade_from} — they already have this exact brand, just on a weaker TLD. Lead with: "I noticed you're running on ${rawData.upgrade_from} — I own ${rawData.upgrade_to} and thought you might want the .com." This is NOT cold — they already invested in this brand.`
+    : isNameMatch
+    ? `\nCOMPANY NAME MATCH: Their company is named "${rawData.company}" — which matches the domain keywords. Lead with: "I came across ${match.domain} and your company name immediately came to mind." They have a natural brand reason to want this domain, even if they haven't thought about it.`
     : '';
 
   return `Write a cold domain sales email. Sound like a real person, not a template.
