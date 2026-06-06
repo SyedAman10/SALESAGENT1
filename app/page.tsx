@@ -317,29 +317,38 @@ export default function Dashboard() {
             {running === 'hot' && <span className="text-red-300 text-xs animate-pulse ml-1">running</span>}
           </button>
 
-          <button onClick={() => openDomainPicker('testnew')} disabled={!!running || sending}
-            className="px-3 py-2.5 rounded border border-cyan-700 hover:border-cyan-500 hover:bg-cyan-900/30 disabled:opacity-40 text-cyan-400 text-xs font-medium transition-colors">
-            <div className="flex items-center gap-2">
-              <span>🧪</span>
-              <div className="text-left">
-                <p>Test Buyer-Type Apollo</p>
-                <p className="text-cyan-600 font-normal text-xs">Founders/owners matching domain buyer profiles</p>
-              </div>
-            </div>
-            {running === 'testnew' && <span className="text-cyan-300 text-xs animate-pulse ml-1">running</span>}
-          </button>
+          {/* Workflow comparison */}
+          <div className="border-t border-gray-800 pt-3 mt-1">
+            <p className="text-gray-500 text-xs uppercase tracking-wider mb-2">Lead Workflows</p>
 
-          <button onClick={() => openDomainPicker('test')} disabled={!!running || sending}
-            className="px-3 py-2.5 rounded border border-amber-700 hover:border-amber-500 hover:bg-amber-900/30 disabled:opacity-40 text-amber-400 text-xs font-medium transition-colors">
-            <div className="flex items-center gap-2">
-              <span>⚡</span>
-              <div className="text-left">
-                <p>Apify: Maps + Contacts</p>
-                <p className="text-amber-600 font-normal text-xs">Google Maps → contact page → real emails</p>
-              </div>
+            <div className="rounded-lg border border-cyan-800/50 bg-cyan-950/20 p-1 mb-2">
+              <p className="text-cyan-600 text-xs font-medium px-2 pt-1 pb-0.5">Workflow A — Apollo</p>
+              <button onClick={() => openDomainPicker('testnew')} disabled={!!running || sending}
+                className="w-full text-left px-2 py-2 rounded hover:bg-cyan-900/30 disabled:opacity-40 transition-colors">
+                <div className="flex items-center justify-between">
+                  <div>
+                    <p className="text-cyan-300 text-xs font-medium">Buyer-Type Title Search</p>
+                    <p className="text-cyan-700 text-xs mt-0.5">Claude titles → Apollo people search · 3 pages</p>
+                  </div>
+                  {running === 'testnew' && <span className="text-cyan-400 text-xs animate-pulse">running</span>}
+                </div>
+              </button>
             </div>
-            {running === 'test' && <span className="text-amber-300 text-xs animate-pulse ml-1">running</span>}
-          </button>
+
+            <div className="rounded-lg border border-amber-800/50 bg-amber-950/20 p-1">
+              <p className="text-amber-600 text-xs font-medium px-2 pt-1 pb-0.5">Workflow B — Apify</p>
+              <button onClick={() => openDomainPicker('test')} disabled={!!running || sending}
+                className="w-full text-left px-2 py-2 rounded hover:bg-amber-900/30 disabled:opacity-40 transition-colors">
+                <div className="flex items-center justify-between">
+                  <div>
+                    <p className="text-amber-300 text-xs font-medium">Google Maps + Contact Scraping</p>
+                    <p className="text-amber-700 text-xs mt-0.5">Maps → crawl contact pages → real emails</p>
+                  </div>
+                  {running === 'test' && <span className="text-amber-400 text-xs animate-pulse">running</span>}
+                </div>
+              </button>
+            </div>
+          </div>
 
           <button onClick={() => openDomainPicker('all')} disabled={!!running || sending}
             className="px-3 py-2.5 rounded bg-blue-600 hover:bg-blue-500 disabled:opacity-40 text-white text-xs font-medium transition-colors">
