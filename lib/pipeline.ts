@@ -1914,10 +1914,13 @@ Domain:
   try { rawData = JSON.parse(lead.raw_data ?? '{}') as Record<string, string>; } catch { /* ok */ }
   const isUpgradeBuyer = lead.source === 'upgrade:buyer' && rawData.upgrade_from;
   const isNameMatch = lead.source === 'namematch:buyer' && rawData.company;
+  const isTrigger = lead.source?.startsWith('trigger:') && rawData.trigger;
   const upgradeContext = isUpgradeBuyer
     ? `\nUPGRADE BUYER: This person is currently using ${rawData.upgrade_from} — they already have this exact brand, just on a weaker TLD. Lead with: "I noticed you're running on ${rawData.upgrade_from} — I own ${rawData.upgrade_to} and thought you might want the .com." This is NOT cold — they already invested in this brand.`
     : isNameMatch
     ? `\nCOMPANY NAME MATCH: Their company is named "${rawData.company}" — which matches the domain keywords. Lead with: "I came across ${match.domain} and your company name immediately came to mind." They have a natural brand reason to want this domain, even if they haven't thought about it.`
+    : isTrigger
+    ? `\nTRIGGER MOMENT: ${rawData.trigger_company} just hit a buying moment — ${rawData.trigger}. Open by referencing that event specifically (congratulate briefly, no flattery), then connect the domain to what they're building NOW. This is why you're emailing TODAY and not last month — make that obvious.`
     : '';
 
   return `Write a cold domain sales email. Sound like a real person, not a template.
@@ -2041,8 +2044,268 @@ export async function syncReplies(): Promise<{ scanned: number; matched: number;
     if (!['unsubscribed', 'blocked'].includes(lead.status)) {
       await sql`UPDATE leads SET status = 'replied', tier = 1 WHERE id = ${lead.id}`;
     }
+    // Product system: every reply becomes a structured engagement data point
+    await logEngagement(lead.id, (ins[0] as { id: number }).id, msg).catch(e => console.error('[engagement]', (e as Error).message));
   }
   return { scanned: inbound.length, matched };
+}
+
+// ── ENGAGEMENT LOG (Dataset 1) ────────────────────────────────────────────────
+// Every response — broker or buyer — is a vote on domain quality. Classified by
+// Claude and stored with domain characteristics for the Broker Interest Score.
+
+async function logEngagement(leadId: number, replyId: number, msg: { from: string; subject: string; snippet: string; receivedAt: Date }): Promise<void> {
+  const leadRows = await sql`SELECT name, email, company, raw_data FROM leads WHERE id = ${leadId}` as { name: string; email: string; company: string | null; raw_data: string }[];
+  const lead = leadRows[0];
+  const sentRows = await sql`SELECT domain, sent_at FROM emails WHERE lead_id = ${leadId} AND status = 'sent' AND sent_at < ${msg.receivedAt.toISOString()} ORDER BY sent_at DESC LIMIT 1` as { domain: string; sent_at: string }[];
+  const lastSent = sentRows[0];
+  if (!lastSent) return;
+
+  const responseHours = (msg.receivedAt.getTime() - new Date(lastSent.sent_at).getTime()) / 3600000;
+  const asset = loadPortfolio().find(a => a.domain === lastSent.domain);
+  const metrics = (await sql`SELECT brandability_score, estimated_value_usd FROM domain_metrics WHERE domain = ${lastSent.domain}`)[0] as { brandability_score: number | null; estimated_value_usd: number | null } | undefined;
+
+  let role = '';
+  try { role = (JSON.parse(lead.raw_data) as { title?: string }).title ?? ''; } catch { /* ok */ }
+
+  let cls = { responder_type: 'other', specialty: '', reasoning: '' };
+  try {
+    const res = await client.messages.create({
+      model: config.model, max_tokens: 256,
+      messages: [{ role: 'user', content: `Classify who sent this reply to a domain sales email.
+
+Sender: ${lead.name} <${msg.from}>${lead.company ? `, company: ${lead.company}` : ''}${role ? `, title: ${role}` : ''}
+Their reply: "${msg.snippet}"
+
+Types: "broker" (domain broker/investor/reseller), "buyer" (end user who would build on the domain), "registrar" (registrar/marketplace employee), "other".
+
+Return JSON only: {"responder_type": "...", "specialty": "their niche if broker, else empty", "reasoning": "one sentence"}` }],
+    });
+    const text = res.content[0].type === 'text' ? res.content[0].text : '{}';
+    cls = { ...cls, ...JSON.parse(text.replace(/```json\n?|\n?```/g, '').trim()) };
+  } catch { /* keep defaults */ }
+
+  await sql`
+    INSERT INTO engagement_log (lead_id, reply_id, domain, domain_length, tld, asking_price, ai_valuation, brandability_score, contact_role, contact_company, responder_type, responder_specialty, response_hours, outcome, reasoning)
+    VALUES (${leadId}, ${replyId}, ${lastSent.domain}, ${lastSent.domain.split('.')[0].length}, ${lastSent.domain.split('.').pop() ?? ''}, ${asset?.asking_price ?? null}, ${metrics?.estimated_value_usd ?? null}, ${metrics?.brandability_score ?? null}, ${role || null}, ${lead.company}, ${cls.responder_type}, ${cls.specialty || null}, ${Math.round(responseHours * 10) / 10}, 'responded', ${cls.reasoning || null})
+    ON CONFLICT (lead_id, domain, outcome) DO NOTHING`;
+}
+
+// Silence is data: contacted leads whose sequence finished with zero replies → 'ignored'
+export async function markIgnoredOutcomes(): Promise<{ marked: number }> {
+  const rows = await sql`
+    SELECT DISTINCT l.id, l.company, l.raw_data, e.domain
+    FROM leads l
+    INNER JOIN emails e ON e.lead_id = l.id AND e.status = 'sent' AND e.sequence_day >= 7
+    WHERE l.status = 'contacted'
+      AND e.sent_at < NOW() - INTERVAL '2 days'
+      AND NOT EXISTS (SELECT 1 FROM replies r WHERE r.lead_id = l.id)
+      AND NOT EXISTS (SELECT 1 FROM engagement_log g WHERE g.lead_id = l.id AND g.domain = e.domain)
+  ` as { id: number; company: string | null; raw_data: string; domain: string }[];
+
+  const portfolio = loadPortfolio();
+  let marked = 0;
+  for (const r of rows) {
+    const asset = portfolio.find(a => a.domain === r.domain);
+    let role = '';
+    try { role = (JSON.parse(r.raw_data) as { title?: string }).title ?? ''; } catch { /* ok */ }
+    await sql`
+      INSERT INTO engagement_log (lead_id, domain, domain_length, tld, asking_price, contact_role, contact_company, outcome)
+      VALUES (${r.id}, ${r.domain}, ${r.domain.split('.')[0].length}, ${r.domain.split('.').pop() ?? ''}, ${asset?.asking_price ?? null}, ${role || null}, ${r.company}, 'ignored')
+      ON CONFLICT (lead_id, domain, outcome) DO NOTHING`;
+    marked++;
+  }
+  return { marked };
+}
+
+// ── DOMAIN METRICS ────────────────────────────────────────────────────────────
+// Numeric characteristics + valuation per domain, snapshotted for correlation analysis.
+
+export async function computeDomainMetrics(): Promise<{ computed: number; skipped: number }> {
+  let computed = 0; let skipped = 0;
+  for (const asset of loadPortfolio()) {
+    const existing = await sql`SELECT id FROM domain_metrics WHERE domain = ${asset.domain}`;
+    if (existing.length) { skipped++; continue; }
+    let scores = { brandability_score: null as number | null, estimated_value_usd: null as number | null, keyword_type: null as string | null };
+    try {
+      const res = await client.messages.create({
+        model: config.model, max_tokens: 256,
+        messages: [{ role: 'user', content: `Score this domain for the aftermarket. Domain: ${asset.domain} (${asset.category}; listed at $${asset.asking_price.toLocaleString()}).
+
+Return JSON only:
+{"brandability_score": <0-100>, "estimated_value_usd": <realistic wholesale-to-retail midpoint>, "keyword_type": "invented|compound|dictionary|geo|other"}` }],
+      });
+      const text = res.content[0].type === 'text' ? res.content[0].text : '{}';
+      scores = { ...scores, ...JSON.parse(text.replace(/```json\n?|\n?```/g, '').trim()) };
+    } catch { /* store characteristics only */ }
+    await sql`
+      INSERT INTO domain_metrics (domain, domain_length, tld, keyword_type, brandability_score, estimated_value_usd)
+      VALUES (${asset.domain}, ${asset.domain.split('.')[0].length}, ${asset.domain.split('.').pop() ?? ''}, ${scores.keyword_type}, ${scores.brandability_score}, ${scores.estimated_value_usd})
+      ON CONFLICT (domain) DO NOTHING`;
+    computed++;
+  }
+  return { computed, skipped };
+}
+
+// ── LOST DEAL AUDIT (Dataset 2) ───────────────────────────────────────────────
+// Runs the five audit questions over zero-response campaigns.
+
+export async function auditLostDeals(limit = 20): Promise<{ audited: number; summary: Record<string, number> }> {
+  type AuditTarget = { id: number; name: string; email: string; company: string | null; raw_data: string; source: string | null; domain: string; subject: string; body: string };
+  const targets = await sql`
+    SELECT DISTINCT ON (l.id) l.id, l.name, l.email, l.company, l.raw_data, l.source, e.domain, e.subject, e.body
+    FROM leads l
+    INNER JOIN emails e ON e.lead_id = l.id AND e.status = 'sent' AND e.sequence_day = 1
+    WHERE l.status = 'contacted'
+      AND e.sent_at < NOW() - INTERVAL '5 days'
+      AND NOT EXISTS (SELECT 1 FROM replies r WHERE r.lead_id = l.id)
+      AND NOT EXISTS (SELECT 1 FROM campaign_audits c WHERE c.lead_id = l.id)
+    ORDER BY l.id
+    LIMIT ${limit}
+  ` as AuditTarget[];
+
+  const portfolio = loadPortfolio();
+  const summary: Record<string, number> = { right_contact: 0, price_defensible: 0, buyer_centric: 0, clear_cta: 0, trigger_moment: 0 };
+  let audited = 0;
+
+  for (const t of targets) {
+    const asset = portfolio.find(a => a.domain === t.domain);
+    const analysis = await getDomainAnalysis(t.domain);
+    let role = '';
+    try { role = (JSON.parse(t.raw_data) as { title?: string }).title ?? ''; } catch { /* ok */ }
+    try {
+      const res = await client.messages.create({
+        model: config.model, max_tokens: 512,
+        messages: [{ role: 'user', content: `Audit this failed domain outreach (zero responses). Be brutally honest — the goal is to find why it failed.
+
+Domain: ${t.domain}, asking $${asset?.asking_price.toLocaleString() ?? '?'}
+Comparable sales: ${analysis?.comparable_sales.slice(0, 3).join('; ') ?? 'unknown'}
+Contact: ${t.name}${role ? ` (${role})` : ''}${t.company ? ` at ${t.company}` : ''}, sourced from: ${t.source}
+Email sent:
+Subject: ${t.subject}
+"""
+${t.body.slice(0, 600)}
+"""
+
+Answer each strictly:
+1. right_contact — is this person plausibly a domain BUYING decision-maker for their company (not a marketplace employee, not random staff)?
+2. price_defensible — is the asking price within ~2x of the comparable sales?
+3. buyer_centric — does the email explain why THIS company specifically needs the domain (vs. generic domain-centric pitch)?
+4. clear_cta — is there one clear, low-friction next step?
+5. trigger_moment — is there any evidence the company was in an active buying moment?
+
+Return JSON only: {"right_contact": bool, "price_defensible": bool, "buyer_centric": bool, "clear_cta": bool, "trigger_moment": bool, "reasoning": "2 sentences max on the main failure"}` }],
+      });
+      const text = res.content[0].type === 'text' ? res.content[0].text : '{}';
+      const a = JSON.parse(text.replace(/```json\n?|\n?```/g, '').trim()) as { right_contact: boolean; price_defensible: boolean; buyer_centric: boolean; clear_cta: boolean; trigger_moment: boolean; reasoning: string };
+      await sql`
+        INSERT INTO campaign_audits (lead_id, domain, right_contact, price_defensible, buyer_centric, clear_cta, trigger_moment, reasoning)
+        VALUES (${t.id}, ${t.domain}, ${a.right_contact}, ${a.price_defensible}, ${a.buyer_centric}, ${a.clear_cta}, ${a.trigger_moment}, ${a.reasoning})
+        ON CONFLICT (lead_id, domain) DO NOTHING`;
+      for (const k of Object.keys(summary)) if (a[k as keyof typeof a]) summary[k]++;
+      audited++;
+    } catch { /* skip */ }
+    await sleep(300);
+  }
+  return { audited, summary };
+}
+
+// ── BROKER INTEREST REPORT ────────────────────────────────────────────────────
+// Descriptive stats over the engagement log. Becomes a real scoring model once
+// the log reaches the 200-300 interactions the strategy doc calls for.
+
+export async function getBrokerInterestReport() {
+  const byType = await sql`SELECT responder_type, outcome, COUNT(*) as c FROM engagement_log GROUP BY responder_type, outcome ORDER BY c DESC`;
+  const byDomain = await sql`
+    SELECT domain, COUNT(*) FILTER (WHERE outcome = 'responded') as responses, COUNT(*) FILTER (WHERE outcome = 'ignored') as ignored,
+           ROUND(AVG(response_hours) FILTER (WHERE response_hours IS NOT NULL)::numeric, 1) as avg_response_hours
+    FROM engagement_log GROUP BY domain`;
+  const brokerSpecialties = await sql`SELECT responder_specialty, COUNT(*) as c FROM engagement_log WHERE responder_type = 'broker' AND responder_specialty IS NOT NULL GROUP BY responder_specialty ORDER BY c DESC LIMIT 10`;
+  const total = await sql`SELECT COUNT(*) as c FROM engagement_log`;
+  return {
+    total_interactions: Number((total[0] as { c: string | number }).c),
+    target_for_model: 200,
+    by_responder_type: byType,
+    by_domain: byDomain,
+    broker_specialties: brokerSpecialties,
+  };
+}
+
+// ── TRIGGER EVENTS ────────────────────────────────────────────────────────────
+// Companies in a moment of motivation: fresh funding news in the domain's
+// industries → company names → Apollo contact lookup. The trigger is stored on
+// the lead so the email writer can open with it.
+
+export async function findTriggerLeads(targetDomains?: string[]): Promise<{ inserted: number; skipped: number; companies: number; errors: Record<string, string> }> {
+  const portfolio = loadPortfolio(targetDomains);
+  const errors: Record<string, string> = {};
+  const companies: { name: string; trigger: string; domain: string }[] = [];
+
+  for (const asset of portfolio) {
+    const analysis = await getDomainAnalysis(asset.domain);
+    if (!analysis) { errors[asset.domain] = 'no analysis'; continue; }
+
+    for (const industry of analysis.industries.slice(0, 3)) {
+      const query = `"${industry}" startup ("raises" OR "series a" OR "seed round" OR "rebrand")`;
+      try {
+        const res = await axios.get(`https://news.google.com/rss/search?q=${encodeURIComponent(query)}&hl=en-US&gl=US&ceid=US:en`, {
+          headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' },
+          timeout: 10000,
+        });
+        const $ = cheerio.load(res.data as string, { xmlMode: true });
+        const titles: string[] = [];
+        $('item title').each((_, el) => { const t = $(el).text().trim(); if (t) titles.push(t); });
+        if (!titles.length) continue;
+
+        const extract = await client.messages.create({
+          model: config.model, max_tokens: 512,
+          messages: [{ role: 'user', content: `Extract company names from these news headlines about funding/rebrands in the "${industry}" space. Only companies that RAISED money or are REBRANDING — not investors, not acquirers.
+
+${titles.slice(0, 25).map((t, i) => `${i + 1}. ${t}`).join('\n')}
+
+Return JSON only: [{"company": "...", "trigger": "short description, e.g. raised $8M Series A (June 2026)"}]
+Max 8. Return [] if none.` }],
+        });
+        const text = extract.content[0].type === 'text' ? extract.content[0].text : '[]';
+        const found = JSON.parse(text.replace(/```json\n?|\n?```/g, '').trim()) as { company: string; trigger: string }[];
+        for (const f of found) companies.push({ name: f.company, trigger: f.trigger, domain: asset.domain });
+      } catch (e) { errors[`news:${industry}`] = (e as Error).message; }
+      await sleep(500);
+    }
+  }
+
+  // Contact discovery via Apollo (requires working Apollo API access)
+  const allLeads: RawLead[] = [];
+  const seen = new Set<string>();
+  for (const c of companies.slice(0, 15)) {
+    try {
+      const res = await axios.post(
+        'https://api.apollo.io/api/v1/mixed_people/api_search',
+        { q_organization_name: c.name, person_seniority: ['owner', 'founder', 'c_suite', 'vp'], per_page: 5, page: 1 },
+        { headers: { 'Content-Type': 'application/json', 'X-Api-Key': config.apolloApiKey } }
+      );
+      const people: ApolloPersonResult[] = res.data?.people ?? [];
+      const relevant = people.filter(p => p.organization?.name?.toLowerCase().includes(c.name.toLowerCase().split(' ')[0]));
+      const toReveal = relevant.filter(p => p.has_email && !p.email).slice(0, 3);
+      const revealed = toReveal.length ? await revealEmails(toReveal) : [];
+      for (const p of [...relevant.filter(p => p.email?.includes('@')), ...revealed].filter(p => p.email)) {
+        if (seen.has(p.email!)) continue;
+        seen.add(p.email!);
+        allLeads.push({
+          name: [p.first_name, p.last_name].filter(Boolean).join(' '),
+          email: p.email!,
+          company: p.organization?.name,
+          linkedin_url: p.linkedin_url,
+          source: 'trigger:funding',
+          raw_data: { trigger: c.trigger, trigger_company: c.name, target_domain: c.domain, title: p.title },
+        });
+      }
+    } catch (e) { errors[`apollo:${c.name}`] = (e as Error).message; }
+    await sleep(400);
+  }
+
+  const { inserted, skipped } = await upsertLeads(allLeads);
+  return { inserted, skipped, companies: companies.length, errors };
 }
 
 // ── CLOSING MODE ──────────────────────────────────────────────────────────────
@@ -2054,10 +2317,17 @@ function formatDeadline(deadline: string): string {
   return new Date(`${deadline}T12:00:00Z`).toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric', timeZone: 'UTC' });
 }
 
+// Sprint mode auto-expires: a domain is only in closing mode until its deadline passes.
+// After that, broker replies route to the engagement log (product mode) instead of the negotiation queue.
+function activeClosingAssets(): Asset[] {
+  const now = Date.now();
+  return loadPortfolio().filter(a => a.deadline && new Date(`${a.deadline}T23:59:59Z`).getTime() >= now);
+}
+
 const OFFER_RE = /\$\s?\d|\b\d+(\.\d+)?k\b|\boffer\b|\bcounter\b|\bbudget\b|\bprice\b|\bpay\b/i;
 
 export async function writeClosingFollowUps(): Promise<{ written: number; flagged: number; skipped: number }> {
-  const closingAssets = loadPortfolio().filter(a => a.deadline);
+  const closingAssets = activeClosingAssets();
   let written = 0; let flagged = 0; let skipped = 0;
 
   for (const asset of closingAssets) {
@@ -2176,7 +2446,7 @@ async function alertOwner(subject: string, body: string): Promise<void> {
 // ── DAILY REPORT ──────────────────────────────────────────────────────────────
 
 export async function generateDailyReport(): Promise<string> {
-  const closingAssets = loadPortfolio().filter(a => a.deadline);
+  const closingAssets = activeClosingAssets();
   const lines: string[] = [];
 
   const newReplies = await sql`
@@ -2434,12 +2704,15 @@ export async function runDailyIngestChain(budgetMs = 270000): Promise<Record<str
   const left = () => budgetMs - (Date.now() - start);
   const out: Record<string, unknown> = {};
 
-  const closing = loadPortfolio().filter(a => a.deadline).map(a => a.domain);
+  const closing = activeClosingAssets().map(a => a.domain);
   const targets = closing.length ? closing : undefined;
 
+  out.metrics = await computeDomainMetrics().catch(e => ({ error: (e as Error).message }));
+  out.ignored = await markIgnoredOutcomes().catch(e => ({ error: (e as Error).message }));
   out.ingest = await testNewSources(targets);
   if (left() > 90000) out.upgrade = await findUpgradeBuyers(targets);
   if (left() > 90000) out.namematch = await findCompanyNameMatches(targets);
+  if (left() > 90000) out.triggers = await findTriggerLeads(targets).catch(e => ({ error: (e as Error).message }));
   if (left() > 90000) out.enrich = await enrichLeads();
   if (left() > 60000) out.match = await matchDomains(targets);
   if (left() > 40000) out.write = await writeEmails(left() - 20000);

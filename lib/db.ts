@@ -45,6 +45,59 @@ export async function initDb(): Promise<void> {
     received_at TIMESTAMPTZ NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
   )`;
+  await db`CREATE TABLE IF NOT EXISTS engagement_log (
+    id SERIAL PRIMARY KEY,
+    lead_id INTEGER NOT NULL REFERENCES leads(id),
+    reply_id INTEGER REFERENCES replies(id),
+    domain TEXT NOT NULL,
+    domain_length INTEGER,
+    tld TEXT,
+    asking_price INTEGER,
+    ai_valuation INTEGER,
+    brandability_score INTEGER,
+    contact_role TEXT,
+    contact_company TEXT,
+    responder_type TEXT,
+    responder_specialty TEXT,
+    response_hours REAL,
+    outcome TEXT NOT NULL,
+    reasoning TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE(lead_id, domain, outcome)
+  )`;
+  await db`CREATE TABLE IF NOT EXISTS campaign_audits (
+    id SERIAL PRIMARY KEY,
+    lead_id INTEGER NOT NULL REFERENCES leads(id),
+    domain TEXT NOT NULL,
+    right_contact BOOLEAN,
+    price_defensible BOOLEAN,
+    buyer_centric BOOLEAN,
+    clear_cta BOOLEAN,
+    trigger_moment BOOLEAN,
+    reasoning TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE(lead_id, domain)
+  )`;
+  await db`CREATE TABLE IF NOT EXISTS human_interventions (
+    id SERIAL PRIMARY KEY,
+    lead_id INTEGER REFERENCES leads(id),
+    domain TEXT NOT NULL,
+    human_knowledge TEXT,
+    objection_handled TEXT,
+    what_changed TEXT,
+    outcome TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  )`;
+  await db`CREATE TABLE IF NOT EXISTS domain_metrics (
+    id SERIAL PRIMARY KEY,
+    domain TEXT NOT NULL UNIQUE,
+    domain_length INTEGER NOT NULL,
+    tld TEXT NOT NULL,
+    keyword_type TEXT,
+    brandability_score INTEGER,
+    estimated_value_usd INTEGER,
+    computed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  )`;
   await db`CREATE TABLE IF NOT EXISTS lead_domain_matches (
     id SERIAL PRIMARY KEY,
     lead_id INTEGER NOT NULL REFERENCES leads(id),

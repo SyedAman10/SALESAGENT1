@@ -9,6 +9,6 @@ export const config = {
   reportEmail: process.env.REPORT_EMAIL ?? process.env.FROM_EMAIL ?? '',
   dailySendLimit: parseInt(process.env.DAILY_SEND_LIMIT ?? '50'),
   leadScoreThreshold: parseInt(process.env.LEAD_SCORE_THRESHOLD ?? '60'),
-  model: 'claude-sonnet-4-20250514' as const,
+  model: 'claude-sonnet-4-6' as const,
   baseUrl: process.env.NEXT_PUBLIC_BASE_URL ?? 'http://localhost:3000',
 };

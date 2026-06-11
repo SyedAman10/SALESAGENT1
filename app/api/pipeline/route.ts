@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { ingestLeads, enrichLeads, matchDomains, writeEmails, decideAndApprove, analyzeDomains, writeFollowUps, testApifyApollo, findHotLeads, testNewSources, findUpgradeBuyers, findCompanyNameMatches, syncReplies, writeClosingFollowUps, generateDailyReport } from '@/lib/pipeline';
+import { ingestLeads, enrichLeads, matchDomains, writeEmails, decideAndApprove, analyzeDomains, writeFollowUps, testApifyApollo, findHotLeads, testNewSources, findUpgradeBuyers, findCompanyNameMatches, syncReplies, writeClosingFollowUps, generateDailyReport, findTriggerLeads, auditLostDeals, computeDomainMetrics, markIgnoredOutcomes, getBrokerInterestReport } from '@/lib/pipeline';
 
 export const maxDuration = 300;
 
@@ -48,6 +48,26 @@ export async function POST(req: NextRequest) {
       case 'report': {
         const report = await generateDailyReport();
         return NextResponse.json({ ok: true, report });
+      }
+      case 'triggers': {
+        const result = await findTriggerLeads(domains);
+        return NextResponse.json({ ok: true, inserted: result.inserted, skipped: result.skipped, companies: result.companies, ...(Object.keys(result.errors).length ? { errors: result.errors } : {}) });
+      }
+      case 'audit': {
+        const result = await auditLostDeals();
+        return NextResponse.json({ ok: true, ...result });
+      }
+      case 'metrics': {
+        const result = await computeDomainMetrics();
+        return NextResponse.json({ ok: true, ...result });
+      }
+      case 'ignored': {
+        const result = await markIgnoredOutcomes();
+        return NextResponse.json({ ok: true, ...result });
+      }
+      case 'broker-report': {
+        const result = await getBrokerInterestReport();
+        return NextResponse.json({ ok: true, ...result });
       }
       case 'hot': {
         const result = await findHotLeads(domains);
