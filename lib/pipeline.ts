@@ -1831,11 +1831,13 @@ Return valid JSON only.`;
 
 // ── WRITE ─────────────────────────────────────────────────────────────────────
 
-export async function writeEmails(): Promise<{ written: number }> {
+export async function writeEmails(budgetMs?: number): Promise<{ written: number }> {
   const leads = await sql`SELECT DISTINCT l.id, l.name, l.email, l.company, l.enrichment, l.raw_data, l.source FROM leads l INNER JOIN lead_domain_matches ldm ON ldm.lead_id = l.id WHERE l.status = 'enriched' AND l.id NOT IN (SELECT DISTINCT lead_id FROM emails WHERE sequence_day = 1)` as LeadRow[];
   let written = 0;
+  const start = Date.now();
 
   for (const lead of leads) {
+    if (budgetMs && Date.now() - start > budgetMs) break;
     const enrichment = JSON.parse(lead.enrichment) as LeadEnrichment;
     const matches = await sql`SELECT domain, relevance_reasoning FROM lead_domain_matches WHERE lead_id = ${lead.id}` as { domain: string; relevance_reasoning: string }[];
 
@@ -2420,6 +2422,30 @@ export async function sendApprovedStream(emit: Emitter): Promise<void> {
   }
 
   emit({ type: 'summary', message: `Done — sent: ${sent} | failed: ${failed}`, sent, failed });
+}
+
+// ── DAILY INGEST CHAIN ────────────────────────────────────────────────────────
+// Time-budgeted front-of-funnel run for cron: find fresh buyers for closing-mode
+// domains, then enrich → match → write → decide. Every step is resumable, so
+// whatever doesn't fit in the budget completes on the next run.
+
+export async function runDailyIngestChain(budgetMs = 270000): Promise<Record<string, unknown>> {
+  const start = Date.now();
+  const left = () => budgetMs - (Date.now() - start);
+  const out: Record<string, unknown> = {};
+
+  const closing = loadPortfolio().filter(a => a.deadline).map(a => a.domain);
+  const targets = closing.length ? closing : undefined;
+
+  out.ingest = await testNewSources(targets);
+  if (left() > 90000) out.upgrade = await findUpgradeBuyers(targets);
+  if (left() > 90000) out.namematch = await findCompanyNameMatches(targets);
+  if (left() > 90000) out.enrich = await enrichLeads();
+  if (left() > 60000) out.match = await matchDomains(targets);
+  if (left() > 40000) out.write = await writeEmails(left() - 20000);
+  if (left() > 10000) out.decide = await decideAndApprove();
+  out.elapsedMs = Date.now() - start;
+  return out;
 }
 
 // ── STATS ─────────────────────────────────────────────────────────────────────
