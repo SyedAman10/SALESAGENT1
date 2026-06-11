@@ -1936,7 +1936,7 @@ Rules (strict):
 - Under 100 words total
 - Subject: 3–6 words, name the domain or their company specifically, no buzzwords (bad: "domain opportunity", good: "${match.domain} — quick question")
 ${isUpgradeBuyer ? `- Open with: "I noticed you're on ${rawData.upgrade_from}..." — this is your hook, use it` : '- Reference ONE specific thing about their business from the company snippet or buyer signals'}
-- End with a single yes/no question
+- End with ONE concrete, low-friction next step that does the thinking for them (e.g. "Want me to send the transfer details?", "I can hold it until Friday if you want to run it by your team") — never a bare "would this be a fit?"
 - Sign as ${config.fromName}
 
 Return JSON only: {"subject": "...", "body": "..."}`;
@@ -2184,7 +2184,7 @@ Contact: ${t.name}${role ? ` (${role})` : ''}${t.company ? ` at ${t.company}` : 
 Email sent:
 Subject: ${t.subject}
 """
-${t.body.slice(0, 600)}
+${t.body.slice(0, 2000)}
 """
 
 Answer each strictly:
