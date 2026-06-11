@@ -1657,6 +1657,10 @@ Return JSON only:
   "score": <0-100>,
   "score_reasoning": "one sentence"
 }
+Scoring rules:
+- Score = likelihood this specific person would personally PURCHASE a $1k-5k domain for a real project.
+- Celebrities, billionaires, VC partners, and Fortune-500 executives score UNDER 20 — they do not buy small domains from cold email, regardless of industry fit.
+- The sweet spot (70+) is founders/owners of small companies (<50 people) actively building in a matching niche.
 Only use facts from the data. Return valid JSON only.`;
 }
 
