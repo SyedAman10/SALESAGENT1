@@ -2026,10 +2026,10 @@ Return valid JSON only.`;
 // Pulls recent inbound Gmail messages and matches them to known leads.
 // Requires the Gmail account to be connected with the gmail.readonly scope.
 
-export async function syncReplies(): Promise<{ scanned: number; matched: number; error?: string }> {
+export async function syncReplies(sinceDays = 7): Promise<{ scanned: number; matched: number; error?: string }> {
   let inbound;
   try {
-    inbound = await fetchRecentInboundEmails(7);
+    inbound = await fetchRecentInboundEmails(sinceDays);
   } catch (e) {
     return { scanned: 0, matched: 0, error: `${(e as Error).message} — reconnect Gmail in the dashboard to grant read access` };
   }
