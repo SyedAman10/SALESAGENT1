@@ -1940,11 +1940,17 @@ Price placeholder: [PRICE]
 
 Style: ${variantInstructions[variant as keyof typeof variantInstructions]}
 
+Structure (research-backed — follow exactly):
+1. First line: a specific observation about THEIR business that proves research (from the company snippet/signals). Never open with the domain or "I".
+2. Bridge: why this domain fits what THEY are building — buyer-centric, not domain-centric. One comp sale max as a price anchor.
+3. Price, stated plainly.
+4. One low-commitment, concrete CTA (e.g. "worth a couple of minutes this week?" / "want me to hold it while you check with your team?") — never a bare "interested?" or "would this be a fit?".
+
 Rules (strict):
-- Under 100 words total
-- Subject: 3–6 words, name the domain or their company specifically, no buzzwords (bad: "domain opportunity", good: "${match.domain} — quick question")
-${isUpgradeBuyer ? `- Open with: "I noticed you're on ${rawData.upgrade_from}..." — this is your hook, use it` : '- Reference ONE specific thing about their business from the company snippet or buyer signals'}
-- End with ONE concrete, low-friction next step that does the thinking for them (e.g. "Want me to send the transfer details?", "I can hold it until Friday if you want to run it by your team") — never a bare "would this be a fit?"
+- 50–90 words total. One ask only.
+- Subject: 3–6 words, personalized with their company or what they're building, no buzzwords (bad: "domain opportunity", good: "${match.domain} — quick question").
+${isUpgradeBuyer ? `- Open with: "I noticed you're on ${rawData.upgrade_from}..." — this is your hook, use it` : ''}
+- Vary your wording — never use the phrases "screams", "premium brandable", or any phrase that sounds like a listing.
 - Sign as ${config.fromName}
 
 Return JSON only: {"subject": "...", "body": "..."}`;
