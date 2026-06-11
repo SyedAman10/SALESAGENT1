@@ -1923,11 +1923,15 @@ Domain:
     ? `\nTRIGGER MOMENT: ${rawData.trigger_company} just hit a buying moment — ${rawData.trigger}. Open by referencing that event specifically (congratulate briefly, no flattery), then connect the domain to what they're building NOW. This is why you're emailing TODAY and not last month — make that obvious.`
     : '';
 
+  const storefrontLine = config.baseUrl.includes('localhost')
+    ? ''
+    : `\nStorefront link (include it naturally — they can see details, chat, or buy instantly there): ${config.baseUrl}/buy/${match.domain}`;
+
   return `Write a cold domain sales email. Sound like a real person, not a template.
 
 Recipient: ${lead.name}${lead.company ? ` @ ${lead.company}` : ''}
 Buyer signals: ${enrichment.key_signals.join('; ')}
-Domain fit: ${match.domain} — ${match.relevance_reasoning}${domainInsights}${companySnippet}${upgradeContext}
+Domain fit: ${match.domain} — ${match.relevance_reasoning}${domainInsights}${companySnippet}${upgradeContext}${storefrontLine}
 Price placeholder: [PRICE]
 
 Style: ${variantInstructions[variant as keyof typeof variantInstructions]}
@@ -2427,7 +2431,7 @@ Rules (strict):
 ${floorRule}
 ${competingRule}
 - Under 60 words. Plain human tone — like a busy founder typing on their phone.
-- No "I hope this finds you well", no fluff, no exclamation marks, no AI-sounding phrasing.
+- No "I hope this finds you well", no fluff, no exclamation marks, no AI-sounding phrasing.${config.baseUrl.includes('localhost') ? '' : `\n- They can make a binding offer or buy instantly at ${config.baseUrl}/buy/${asset.domain} — mention it when it helps close.`}
 - Subject: if replying to their message, reuse their subject with "Re:" — their subject was "${lastReply.subject}".
 - Sign as ${config.fromName}.
 
@@ -2492,6 +2496,13 @@ export async function generateDailyReport(): Promise<string> {
       lines.push(`AWAITING YOUR APPROVAL (${pending.length}):`);
       for (const p of pending) lines.push(`- #${p.id} [${p.variant}] to ${p.email}: "${p.subject}"`);
     }
+  }
+
+  const offers = await sql`SELECT domain, name, email, amount, status, created_at FROM storefront_offers WHERE created_at > NOW() - INTERVAL '24 hours' ORDER BY created_at DESC` as { domain: string; name: string | null; email: string; amount: number; status: string; created_at: string }[];
+  if (offers.length) {
+    lines.push('');
+    lines.push(`STOREFRONT OFFERS (last 24h): ${offers.length}`);
+    for (const o of offers) lines.push(`- ${o.domain}: $${o.amount.toLocaleString()} from ${o.name ?? '?'} <${o.email}> — ${o.status}`);
   }
 
   const sentToday = Number(((await sql`SELECT COUNT(*) as c FROM send_log WHERE sent_at::date = CURRENT_DATE AND result = 'ok'`)[0] as { c: string | number }).c ?? 0);

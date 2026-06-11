@@ -47,3 +47,6 @@ db.sqlite-wal
 
 # claude
 .claude/
+
+# client docs - not for distribution
+*.docx
