@@ -1,7 +1,7 @@
 import Anthropic from '@anthropic-ai/sdk';
 import axios from 'axios';
 import * as cheerio from 'cheerio';
-import { sendViaGmail } from './gmail';
+import { sendViaGmail, fetchRecentInboundEmails } from './gmail';
 import { getEffectiveDailyLimit } from './warmup';
 import fs from 'fs';
 import path from 'path';
@@ -422,7 +422,7 @@ async function fetchApolloByCompany(): Promise<RawLead[]> {
 
   const companies = [
     'Sedo', 'DAN.com', 'Afternic', 'BrandBucket', 'SquadHelp', 'NameFind',
-    'MediaOptions', 'DomainAgents', 'GoDaddy Auctions',
+    'MediaOptions', 'GoDaddy Auctions',
     'Uniregistry', 'Epik', 'Flippa', 'HugeDomains', 'Namecheap',
   ];
 
@@ -663,6 +663,25 @@ function isCorporateNonDomainLead(company?: string): boolean {
   return CORPORATE_BLOCKLIST.some(term => lower.includes(term));
 }
 
+// Hard blacklist — never store or contact leads from these email domains/sources
+const BLOCKED_EMAIL_DOMAINS = ['domainagents.com'];
+const BLOCKED_SOURCES = new Set(['apollo:DomainAgents']);
+
+export function isBlockedLead(email: string, source?: string | null): boolean {
+  const emailDomain = email.split('@')[1]?.toLowerCase() ?? '';
+  if (BLOCKED_EMAIL_DOMAINS.includes(emailDomain)) return true;
+  return source != null && BLOCKED_SOURCES.has(source);
+}
+
+// Tier 1 = Apollo-sourced broker/industry leads (warm-channel priority).
+// Excludes domain-specific end-user searches (apollo:<domain>-buyer/-industry/-titles) and brand matches.
+function leadTier(email: string, source?: string | null): number {
+  if (!source?.startsWith('apollo:')) return 2;
+  if (BLOCKED_SOURCES.has(source)) return 2;
+  if (/-(buyer|industry|titles)$/.test(source) || source === 'apollo:brand-match') return 2;
+  return 1;
+}
+
 const VALID_EMAIL_RE = /^[^\s@]+@[^\s@]+\.[a-zA-Z]{2,}$/;
 const FAKE_EMAIL_EXTS = new Set(['png','jpg','jpeg','gif','svg','webp','ico','bmp','pdf','zip','mp4','mp3','css','js','ts','tsx','jsx','json','xml','html','woff','ttf','eot','woff2','2x']);
 
@@ -677,9 +696,11 @@ async function upsertLeads(leads: (RawLead & { source?: string })[]): Promise<{ 
   for (const l of leads) {
     if (!isValidEmail(l.email)) { skipped++; continue; }
     if (isCorporateNonDomainLead(l.company)) { skipped++; continue; }
+    const source = l.source ?? 'scrape';
+    if (isBlockedLead(l.email, source)) { skipped++; continue; }
     const rows = await sql`
-      INSERT INTO leads (name, email, company, linkedin_url, source, raw_data, status)
-      VALUES (${l.name}, ${l.email}, ${l.company ?? null}, ${l.linkedin_url ?? null}, ${(l as RawLead & { source?: string }).source ?? 'scrape'}, ${JSON.stringify(l.raw_data)}, 'new')
+      INSERT INTO leads (name, email, company, linkedin_url, source, raw_data, status, tier)
+      VALUES (${l.name}, ${l.email}, ${l.company ?? null}, ${l.linkedin_url ?? null}, ${source}, ${JSON.stringify(l.raw_data)}, 'new', ${leadTier(l.email, source)})
       ON CONFLICT (email) DO NOTHING RETURNING id`;
     rows.length > 0 ? inserted++ : skipped++;
   }
@@ -1641,7 +1662,14 @@ Only use facts from the data. Return valid JSON only.`;
 
 // ── DOMAIN ANALYSIS ───────────────────────────────────────────────────────────
 
-interface Asset { domain: string; category: string; asking_price: number; description: string; }
+interface Asset {
+  domain: string;
+  category: string;
+  asking_price: number;
+  description: string;
+  deadline?: string;      // ISO date — presence switches this domain to closing mode
+  floor_price?: number;   // counter-offers below this are never accepted; unset = flag every offer
+}
 
 export interface DomainAnalysis {
   ideal_buyer_types: string[];
@@ -1922,16 +1950,18 @@ export async function writeFollowUps(): Promise<{ written: number }> {
   ` as ContactedRow[];
 
   let written = 0;
+  const portfolio = loadPortfolio();
 
   for (const lead of contacted) {
     const analysis = await getDomainAnalysis(lead.domain);
+    const asset = portfolio.find(a => a.domain === lead.domain);
     for (const day of [3, 5, 7]) {
       const existing = await sql`SELECT id FROM emails WHERE lead_id = ${lead.id} AND domain = ${lead.domain} AND sequence_day = ${day}`;
       if (existing.length) continue;
       try {
         const res = await client.messages.create({
           model: config.model, max_tokens: 400,
-          messages: [{ role: 'user', content: followUpPrompt(lead, day, lead.day1_body, analysis, lead.domain) }],
+          messages: [{ role: 'user', content: followUpPrompt(lead, day, lead.day1_body, analysis, lead.domain, asset?.deadline) }],
         });
         const text = res.content[0].type === 'text' ? res.content[0].text : '';
         const parsed = JSON.parse(text.replace(/```json\n?|\n?```/g, '').trim()) as { subject: string; body: string };
@@ -1950,12 +1980,16 @@ function followUpPrompt(
   originalBody: string,
   analysis: DomainAnalysis | null,
   domain: string,
+  deadline?: string,
 ): string {
   const enrichment = JSON.parse(lead.enrichment) as LeadEnrichment;
+  const deadlineNote = deadline
+    ? ` The sale closes ${formatDeadline(deadline)} — state this plainly as a real deadline, best offer wins.`
+    : '';
   const angles: Record<number, string> = {
-    3: 'Brief casual check-in, 2-3 sentences. Mention you reached out a couple days ago. No hard sell.',
-    5: 'New angle — lead with a specific use case or value prop they may not have considered. 3-4 sentences.',
-    7: 'Final follow-up. Create gentle urgency — mention other parties have shown interest. Keep it short and warm.',
+    3: `Brief casual check-in, 2-3 sentences. Mention you reached out a couple days ago. No hard sell.${deadlineNote}`,
+    5: `New angle — lead with a specific use case or value prop they may not have considered. 3-4 sentences.${deadlineNote}`,
+    7: `Final follow-up. Create gentle urgency — mention other parties have shown interest. Keep it short and warm.${deadlineNote}`,
   };
   const domainContext = analysis
     ? `Domain: ${domain}\nOne-liner: ${analysis.one_liner}\nHook: ${analysis.email_hooks[day === 5 ? 1 : 0] ?? analysis.email_hooks[0]}`
@@ -1977,6 +2011,227 @@ Rules: under 80 words, sign as ${config.fromName}, no spam trigger words, sounds
 
 Return JSON: {"subject": "...", "body": "..."}
 Return valid JSON only.`;
+}
+
+// ── REPLIES ───────────────────────────────────────────────────────────────────
+// Pulls recent inbound Gmail messages and matches them to known leads.
+// Requires the Gmail account to be connected with the gmail.readonly scope.
+
+export async function syncReplies(): Promise<{ scanned: number; matched: number; error?: string }> {
+  let inbound;
+  try {
+    inbound = await fetchRecentInboundEmails(7);
+  } catch (e) {
+    return { scanned: 0, matched: 0, error: `${(e as Error).message} — reconnect Gmail in the dashboard to grant read access` };
+  }
+
+  let matched = 0;
+  for (const msg of inbound) {
+    const rows = await sql`SELECT id, status FROM leads WHERE LOWER(email) = ${msg.from}` as { id: number; status: string }[];
+    const lead = rows[0];
+    if (!lead) continue;
+    const ins = await sql`
+      INSERT INTO replies (lead_id, gmail_message_id, gmail_thread_id, rfc_message_id, from_email, subject, snippet, received_at)
+      VALUES (${lead.id}, ${msg.messageId}, ${msg.threadId}, ${msg.rfcMessageId}, ${msg.from}, ${msg.subject}, ${msg.snippet}, ${msg.receivedAt.toISOString()})
+      ON CONFLICT (gmail_message_id) DO NOTHING RETURNING id`;
+    if (!ins.length) continue;
+    matched++;
+    if (!['unsubscribed', 'blocked'].includes(lead.status)) {
+      await sql`UPDATE leads SET status = 'replied', tier = 1 WHERE id = ${lead.id}`;
+    }
+  }
+  return { scanned: inbound.length, matched };
+}
+
+// ── CLOSING MODE ──────────────────────────────────────────────────────────────
+// For domains with a deadline set in domains.json: replied leads get short,
+// direct negotiation/nudge emails. Drafts are created as 'pending' — they only
+// send after manual approval. Offers always flag the owner immediately.
+
+function formatDeadline(deadline: string): string {
+  return new Date(`${deadline}T12:00:00Z`).toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric', timeZone: 'UTC' });
+}
+
+const OFFER_RE = /\$\s?\d|\b\d+(\.\d+)?k\b|\boffer\b|\bcounter\b|\bbudget\b|\bprice\b|\bpay\b/i;
+
+export async function writeClosingFollowUps(): Promise<{ written: number; flagged: number; skipped: number }> {
+  const closingAssets = loadPortfolio().filter(a => a.deadline);
+  let written = 0; let flagged = 0; let skipped = 0;
+
+  for (const asset of closingAssets) {
+    type RepliedLead = { id: number; name: string; email: string; company: string | null; source: string | null };
+    const replied = await sql`
+      SELECT DISTINCT l.id, l.name, l.email, l.company, l.source
+      FROM leads l
+      INNER JOIN emails e ON e.lead_id = l.id AND e.domain = ${asset.domain} AND e.status = 'sent'
+      WHERE l.status = 'replied'` as RepliedLead[];
+
+    const competingCount = replied.length;
+
+    for (const lead of replied) {
+      if (isBlockedLead(lead.email, lead.source)) { skipped++; continue; }
+
+      const lastReplyRows = await sql`SELECT subject, snippet, received_at FROM replies WHERE lead_id = ${lead.id} ORDER BY received_at DESC LIMIT 1` as { subject: string; snippet: string; received_at: string }[];
+      const lastReply = lastReplyRows[0];
+      if (!lastReply) continue;
+
+      const queued = await sql`SELECT id FROM emails WHERE lead_id = ${lead.id} AND domain = ${asset.domain} AND variant LIKE 'closing%' AND status IN ('pending', 'approved')`;
+      if (queued.length) { skipped++; continue; }
+
+      const lastOutRows = await sql`SELECT sent_at, variant FROM emails WHERE lead_id = ${lead.id} AND domain = ${asset.domain} AND status = 'sent' ORDER BY sent_at DESC LIMIT 1` as { sent_at: string; variant: string }[];
+      const lastOut = lastOutRows[0];
+      const replyAt = new Date(lastReply.received_at).getTime();
+      const lastOutAt = lastOut ? new Date(lastOut.sent_at).getTime() : 0;
+      const isOffer = OFFER_RE.test(`${lastReply.subject} ${lastReply.snippet}`);
+
+      let variant: string;
+      if (replyAt > lastOutAt) {
+        // They spoke last — respond now
+        variant = isOffer ? 'closing-negotiation' : 'closing-reply';
+      } else {
+        // We spoke last — nudge at 24h, then 48h, then stop
+        if (lastOut?.variant === 'closing-nudge-48h') { skipped++; continue; }
+        const quietHours = (Date.now() - lastOutAt) / 3600000;
+        if (quietHours < 24) { skipped++; continue; }
+        variant = lastOut?.variant === 'closing-nudge-24h' ? 'closing-nudge-48h' : 'closing-nudge-24h';
+      }
+
+      try {
+        const res = await client.messages.create({
+          model: config.model, max_tokens: 400,
+          messages: [{ role: 'user', content: closingPrompt(lead, asset, variant, lastReply, competingCount) }],
+        });
+        const text = res.content[0].type === 'text' ? res.content[0].text : '';
+        const parsed = JSON.parse(text.replace(/```json\n?|\n?```/g, '').trim()) as { subject: string; body: string };
+        await sql`INSERT INTO emails (lead_id, domain, subject, body, variant, status, sequence_day) VALUES (${lead.id}, ${asset.domain}, ${parsed.subject}, ${parsed.body}, ${variant}, 'pending', 1)`;
+        written++;
+        if (isOffer) {
+          flagged++;
+          await alertOwner(
+            `[ACTION NEEDED] ${lead.name} (${lead.email}) — ${asset.domain}`,
+            `Possible offer in their last reply:\n\n"${lastReply.snippet}"\n\nDrafted response (held as pending, will NOT send until you approve):\n\nSubject: ${parsed.subject}\n\n${parsed.body}\n\nAsking: $${asset.asking_price.toLocaleString()} | Floor: ${asset.floor_price ? `$${asset.floor_price.toLocaleString()}` : 'NOT SET — define floor_price in domains.json'} | Deadline: ${formatDeadline(asset.deadline!)}`
+          );
+        }
+      } catch { skipped++; }
+      await sleep(300);
+    }
+  }
+  return { written, flagged, skipped };
+}
+
+function closingPrompt(
+  lead: { name: string; company: string | null },
+  asset: Asset,
+  variant: string,
+  lastReply: { subject: string; snippet: string },
+  competingCount: number,
+): string {
+  const deadlineStr = formatDeadline(asset.deadline!);
+  const floorRule = asset.floor_price
+    ? `- If they made an offer at or above $${asset.floor_price.toLocaleString()}, you may signal it's workable and push to close. Below $${asset.floor_price.toLocaleString()}: do NOT accept or counter — say the owner is reviewing all offers before ${deadlineStr}.`
+    : `- Do NOT accept, reject, or counter any specific price — say the owner is reviewing all offers before ${deadlineStr}.`;
+  const competingRule = competingCount >= 2
+    ? `- It is TRUE that ${competingCount} interested parties are in active conversations about this domain — mention competing interest once, factually, to drive urgency.`
+    : '- Do NOT claim other interest — there is only this one active conversation.';
+
+  const instructions: Record<string, string> = {
+    'closing-reply': 'They replied with interest. Respond directly: confirm the asking price, state the deadline, ask if they want to move forward.',
+    'closing-negotiation': 'They likely mentioned a price or offer. Move the negotiation forward per the price rules below.',
+    'closing-nudge-24h': 'They replied earlier but went quiet for 24h+. One short nudge: 2 sentences max, reference the deadline, ask for their decision.',
+    'closing-nudge-48h': 'Second and final nudge after 48h+ of silence. Even shorter. Deadline is firm — last chance to make an offer.',
+  };
+
+  return `Write the next email in an active domain sale negotiation. This is a WARM thread — they already replied.
+
+Domain: ${asset.domain}
+Asking price: $${asset.asking_price.toLocaleString()}
+Hard deadline: ${deadlineStr} — the sale closes then, best offer wins. This is real.
+Buyer: ${lead.name}${lead.company ? ` @ ${lead.company}` : ''}
+Their last message: "${lastReply.snippet}"
+
+Task: ${instructions[variant] ?? instructions['closing-reply']}
+
+Rules (strict):
+${floorRule}
+${competingRule}
+- Under 60 words. Plain human tone — like a busy founder typing on their phone.
+- No "I hope this finds you well", no fluff, no exclamation marks, no AI-sounding phrasing.
+- Subject: if replying to their message, reuse their subject with "Re:" — their subject was "${lastReply.subject}".
+- Sign as ${config.fromName}.
+
+Return JSON only: {"subject": "...", "body": "..."}`;
+}
+
+async function alertOwner(subject: string, body: string): Promise<void> {
+  if (!config.reportEmail) return;
+  try {
+    await sendViaGmail({ to: config.reportEmail, subject, body });
+  } catch (e) {
+    console.error('[alertOwner]', (e as Error).message);
+  }
+}
+
+// ── DAILY REPORT ──────────────────────────────────────────────────────────────
+
+export async function generateDailyReport(): Promise<string> {
+  const closingAssets = loadPortfolio().filter(a => a.deadline);
+  const lines: string[] = [];
+
+  const newReplies = await sql`
+    SELECT r.from_email, r.subject, r.snippet, r.received_at, l.name, l.company
+    FROM replies r INNER JOIN leads l ON l.id = r.lead_id
+    WHERE r.created_at > NOW() - INTERVAL '24 hours'
+    ORDER BY r.received_at DESC` as { from_email: string; subject: string; snippet: string; received_at: string; name: string; company: string | null }[];
+
+  lines.push(`REPLIES (last 24h): ${newReplies.length}`);
+  for (const r of newReplies) {
+    lines.push(`- ${r.name}${r.company ? ` (${r.company})` : ''} <${r.from_email}>: "${r.snippet.slice(0, 140)}"`);
+  }
+
+  for (const asset of closingAssets) {
+    const daysLeft = Math.ceil((new Date(`${asset.deadline}T23:59:59Z`).getTime() - Date.now()) / 86400000);
+    lines.push('');
+    lines.push(`CLOSING — ${asset.domain} ($${asset.asking_price.toLocaleString()}, deadline ${formatDeadline(asset.deadline!)}, ${daysLeft} day(s) left)`);
+
+    type ThreadRow = { id: number; name: string; email: string; company: string | null; last_reply: string | null; last_reply_at: string | null; last_out_variant: string | null; last_out_at: string | null };
+    const threads = await sql`
+      SELECT DISTINCT l.id, l.name, l.email, l.company,
+        (SELECT snippet FROM replies WHERE lead_id = l.id ORDER BY received_at DESC LIMIT 1) as last_reply,
+        (SELECT received_at::text FROM replies WHERE lead_id = l.id ORDER BY received_at DESC LIMIT 1) as last_reply_at,
+        (SELECT variant FROM emails WHERE lead_id = l.id AND domain = ${asset.domain} AND status = 'sent' ORDER BY sent_at DESC LIMIT 1) as last_out_variant,
+        (SELECT sent_at::text FROM emails WHERE lead_id = l.id AND domain = ${asset.domain} AND status = 'sent' ORDER BY sent_at DESC LIMIT 1) as last_out_at
+      FROM leads l
+      INNER JOIN emails e ON e.lead_id = l.id AND e.domain = ${asset.domain} AND e.status = 'sent'
+      WHERE l.status = 'replied'` as ThreadRow[];
+
+    if (!threads.length) lines.push('- No warm threads yet (no replies matched to this domain).');
+    for (const t of threads) {
+      const offer = t.last_reply && OFFER_RE.test(t.last_reply) ? ' ⚠ POSSIBLE OFFER — needs your input' : '';
+      const weOwe = t.last_reply_at && (!t.last_out_at || new Date(t.last_reply_at) > new Date(t.last_out_at));
+      const next = weOwe ? 'next: respond (draft pending approval)' : `next: ${t.last_out_variant === 'closing-nudge-48h' ? 'sequence done — your call' : 'nudge when 24h quiet'}`;
+      lines.push(`- ${t.name}${t.company ? ` (${t.company})` : ''} <${t.email}> — last reply: "${(t.last_reply ?? '').slice(0, 100)}" — ${next}${offer}`);
+    }
+
+    const pending = await sql`
+      SELECT e.id, e.subject, e.variant, l.email
+      FROM emails e INNER JOIN leads l ON l.id = e.lead_id
+      WHERE e.domain = ${asset.domain} AND e.variant LIKE 'closing%' AND e.status = 'pending'` as { id: number; subject: string; variant: string; email: string }[];
+    if (pending.length) {
+      lines.push(`AWAITING YOUR APPROVAL (${pending.length}):`);
+      for (const p of pending) lines.push(`- #${p.id} [${p.variant}] to ${p.email}: "${p.subject}"`);
+    }
+  }
+
+  const sentToday = Number(((await sql`SELECT COUNT(*) as c FROM send_log WHERE sent_at::date = CURRENT_DATE AND result = 'ok'`)[0] as { c: string | number }).c ?? 0);
+  lines.push('');
+  lines.push(`Sent today: ${sentToday}`);
+  return lines.join('\n');
+}
+
+export async function sendDailyReport(): Promise<{ sent: boolean }> {
+  const report = await generateDailyReport();
+  await alertOwner(`Daily domain sales report — ${new Date().toISOString().slice(0, 10)}`, report);
+  return { sent: true };
 }
 
 // ── DECIDE ────────────────────────────────────────────────────────────────────
@@ -2030,44 +2285,17 @@ async function pickVariant(enrichment: LeadEnrichment, variants: { id: number; s
 export async function sendApproved(): Promise<{ sent: number; failed: number }> {
   const sentTodayRows = await sql`SELECT COUNT(*) as c FROM send_log WHERE sent_at::date = CURRENT_DATE`;
   const sentToday = Number((sentTodayRows[0] as { c: string | number }).c ?? 0);
-  const remaining = config.dailySendLimit - sentToday;
+  const remaining = (await getEffectiveDailyLimit()) - sentToday;
   if (remaining <= 0) return { sent: 0, failed: 0 };
 
-  type SendItem = { id: number; lead_id: number; domain: string; subject: string; body: string; sequence_day: number };
-
-  const day1 = await sql`
-    SELECT e.id, e.lead_id, e.domain, e.subject, e.body, e.sequence_day
-    FROM emails e INNER JOIN leads l ON l.id = e.lead_id
-    WHERE e.status = 'approved' AND e.sequence_day = 1 AND l.status = 'enriched'
-    ORDER BY l.score DESC
-  ` as SendItem[];
-
-  type FollowUpRow = SendItem & { day1_sent: Date | string | null };
-  const dueFollowUpsAll = await sql`
-    SELECT e.id, e.lead_id, e.domain, e.subject, e.body, e.sequence_day,
-           (SELECT MAX(e2.sent_at) FROM emails e2 WHERE e2.lead_id = e.lead_id AND e2.status = 'sent' AND e2.sequence_day = 1) as day1_sent
-    FROM emails e INNER JOIN leads l ON l.id = e.lead_id
-    WHERE e.status = 'approved' AND e.sequence_day > 1 AND l.status = 'contacted'
-    ORDER BY l.score DESC
-  ` as FollowUpRow[];
-  const dueFollowUps = dueFollowUpsAll.filter(e => {
-    if (!e.day1_sent) return false;
-    const daysPassed = (Date.now() - new Date(e.day1_sent as string).getTime()) / 86400000;
-    return daysPassed >= e.sequence_day - 1;
-  });
-
-  const queue = [...day1, ...dueFollowUps].slice(0, remaining);
+  const queue = (await buildSendQueue()).slice(0, remaining);
   let sent = 0; let failed = 0;
 
   for (const email of queue) {
-    const leadRows = await sql`SELECT name, email FROM leads WHERE id = ${email.lead_id}`;
-    const lead = leadRows[0] as { name: string; email: string };
-    const bodyWithFooter = `${email.body}\n\n---\nTo unsubscribe: ${config.baseUrl}/api/unsubscribe?email=${encodeURIComponent(lead.email)}`;
+    const lead = await getSendTarget(email);
+    if (!lead) { failed++; continue; }
     try {
-      await sendViaGmail({ to: lead.email, subject: email.subject, body: bodyWithFooter });
-      await sql`UPDATE emails SET status = 'sent', sent_at = NOW() WHERE id = ${email.id}`;
-      if (email.sequence_day === 1) await sql`UPDATE leads SET status = 'contacted' WHERE id = ${email.lead_id}`;
-      await sql`INSERT INTO send_log (email_id, result) VALUES (${email.id}, 'ok')`;
+      await dispatchEmail(email, lead);
       sent++;
     } catch (e) {
       await sql`INSERT INTO send_log (email_id, result) VALUES (${email.id}, ${`error: ${(e as Error).message}`})`;
@@ -2076,6 +2304,74 @@ export async function sendApproved(): Promise<{ sent: number; failed: number }> 
     await sleep(10000 + Math.random() * 5000);
   }
   return { sent, failed };
+}
+
+type SendItem = { id: number; lead_id: number; domain: string; subject: string; body: string; sequence_day: number; variant: string };
+
+// Closing-mode emails (warm replied leads) go first, then day-1 by tier/score, then due follow-ups.
+async function buildSendQueue(): Promise<SendItem[]> {
+  const closing = await sql`
+    SELECT e.id, e.lead_id, e.domain, e.subject, e.body, e.sequence_day, e.variant
+    FROM emails e INNER JOIN leads l ON l.id = e.lead_id
+    WHERE e.status = 'approved' AND e.variant LIKE 'closing%' AND l.status = 'replied'
+    ORDER BY l.tier ASC, l.score DESC
+  ` as SendItem[];
+
+  const day1 = await sql`
+    SELECT e.id, e.lead_id, e.domain, e.subject, e.body, e.sequence_day, e.variant
+    FROM emails e INNER JOIN leads l ON l.id = e.lead_id
+    WHERE e.status = 'approved' AND e.sequence_day = 1 AND e.variant NOT LIKE 'closing%' AND l.status = 'enriched'
+    ORDER BY l.tier ASC, l.score DESC
+  ` as SendItem[];
+
+  type FollowUpRow = SendItem & { day1_sent: Date | string | null };
+  const dueFollowUpsAll = await sql`
+    SELECT e.id, e.lead_id, e.domain, e.subject, e.body, e.sequence_day, e.variant,
+           (SELECT MAX(e2.sent_at) FROM emails e2 WHERE e2.lead_id = e.lead_id AND e2.status = 'sent' AND e2.sequence_day = 1) as day1_sent
+    FROM emails e INNER JOIN leads l ON l.id = e.lead_id
+    WHERE e.status = 'approved' AND e.sequence_day > 1 AND l.status = 'contacted'
+    ORDER BY l.tier ASC, l.score DESC
+  ` as FollowUpRow[];
+  const dueFollowUps = dueFollowUpsAll.filter(e => {
+    if (!e.day1_sent) return false;
+    const daysPassed = (Date.now() - new Date(e.day1_sent as string).getTime()) / 86400000;
+    return daysPassed >= e.sequence_day - 1;
+  });
+
+  return [...closing, ...day1, ...dueFollowUps];
+}
+
+// Resolves the recipient and enforces the blacklist at the last line of defense.
+async function getSendTarget(email: SendItem): Promise<{ name: string; email: string } | null> {
+  const leadRows = await sql`SELECT name, email, source FROM leads WHERE id = ${email.lead_id}`;
+  const lead = leadRows[0] as { name: string; email: string; source: string | null } | undefined;
+  if (!lead) return null;
+  if (isBlockedLead(lead.email, lead.source)) {
+    await sql`UPDATE emails SET status = 'rejected' WHERE id = ${email.id}`;
+    await sql`INSERT INTO send_log (email_id, result) VALUES (${email.id}, 'blocked: blacklisted lead')`;
+    return null;
+  }
+  return lead;
+}
+
+async function dispatchEmail(email: SendItem, lead: { name: string; email: string }): Promise<void> {
+  const isClosing = email.variant.startsWith('closing');
+  // Warm negotiation replies thread into the existing Gmail conversation, no unsubscribe footer
+  let threadId: string | undefined;
+  let inReplyTo: string | undefined;
+  if (isClosing) {
+    const replyRows = await sql`SELECT gmail_thread_id, rfc_message_id FROM replies WHERE lead_id = ${email.lead_id} ORDER BY received_at DESC LIMIT 1` as { gmail_thread_id: string | null; rfc_message_id: string | null }[];
+    threadId = replyRows[0]?.gmail_thread_id ?? undefined;
+    inReplyTo = replyRows[0]?.rfc_message_id ?? undefined;
+  }
+  const body = isClosing
+    ? email.body
+    : `${email.body}\n\n---\nTo unsubscribe: ${config.baseUrl}/api/unsubscribe?email=${encodeURIComponent(lead.email)}`;
+
+  await sendViaGmail({ to: lead.email, subject: email.subject, body, threadId, inReplyTo });
+  await sql`UPDATE emails SET status = 'sent', sent_at = NOW() WHERE id = ${email.id}`;
+  if (email.sequence_day === 1 && !isClosing) await sql`UPDATE leads SET status = 'contacted' WHERE id = ${email.lead_id}`;
+  await sql`INSERT INTO send_log (email_id, result) VALUES (${email.id}, 'ok')`;
 }
 
 // ── SEND (streaming) ──────────────────────────────────────────────────────────
@@ -2093,45 +2389,22 @@ export async function sendApprovedStream(emit: Emitter): Promise<void> {
     return;
   }
 
-  type SendItem = { id: number; lead_id: number; domain: string; subject: string; body: string; sequence_day: number };
+  const queue = (await buildSendQueue()).slice(0, remaining);
 
-  const day1 = await sql`
-    SELECT e.id, e.lead_id, e.domain, e.subject, e.body, e.sequence_day
-    FROM emails e INNER JOIN leads l ON l.id = e.lead_id
-    WHERE e.status = 'approved' AND e.sequence_day = 1 AND l.status = 'enriched'
-    ORDER BY l.score DESC
-  ` as SendItem[];
-
-  type FollowUpRow = SendItem & { day1_sent: Date | string | null };
-  const dueFollowUpsAll = await sql`
-    SELECT e.id, e.lead_id, e.domain, e.subject, e.body, e.sequence_day,
-           (SELECT MAX(e2.sent_at) FROM emails e2 WHERE e2.lead_id = e.lead_id AND e2.status = 'sent' AND e2.sequence_day = 1) as day1_sent
-    FROM emails e INNER JOIN leads l ON l.id = e.lead_id
-    WHERE e.status = 'approved' AND e.sequence_day > 1 AND l.status = 'contacted'
-    ORDER BY l.score DESC
-  ` as FollowUpRow[];
-  const dueFollowUps = dueFollowUpsAll.filter(e => {
-    if (!e.day1_sent) return false;
-    const daysPassed = (Date.now() - new Date(e.day1_sent as string).getTime()) / 86400000;
-    return daysPassed >= e.sequence_day - 1;
-  });
-
-  const queue = [...day1, ...dueFollowUps].slice(0, remaining);
-
-  emit({ type: 'log', message: `Sending ${queue.length} emails (${day1.length} new + ${dueFollowUps.length} follow-ups due, limit: ${dailyLimit} — ${remaining} remaining today)` });
+  emit({ type: 'log', message: `Sending ${queue.length} emails (limit: ${dailyLimit} — ${remaining} remaining today)` });
 
   let sent = 0; let failed = 0;
 
   for (const email of queue) {
-    const leadRows = await sql`SELECT name, email FROM leads WHERE id = ${email.lead_id}`;
-    const lead = leadRows[0] as { name: string; email: string };
-    const label = email.sequence_day > 1 ? `Day ${email.sequence_day} follow-up` : 'Day 1';
-    const bodyWithFooter = `${email.body}\n\n---\nTo unsubscribe: ${config.baseUrl}/api/unsubscribe?email=${encodeURIComponent(lead.email)}`;
+    const lead = await getSendTarget(email);
+    if (!lead) {
+      failed++;
+      emit({ type: 'failed', message: `✗ lead #${email.lead_id}: blocked or missing` });
+      continue;
+    }
+    const label = email.variant.startsWith('closing') ? email.variant : email.sequence_day > 1 ? `Day ${email.sequence_day} follow-up` : 'Day 1';
     try {
-      await sendViaGmail({ to: lead.email, subject: email.subject, body: bodyWithFooter });
-      await sql`UPDATE emails SET status = 'sent', sent_at = NOW() WHERE id = ${email.id}`;
-      if (email.sequence_day === 1) await sql`UPDATE leads SET status = 'contacted' WHERE id = ${email.lead_id}`;
-      await sql`INSERT INTO send_log (email_id, result) VALUES (${email.id}, 'ok')`;
+      await dispatchEmail(email, lead);
       sent++;
       emit({ type: 'sent', message: `✓ ${lead.email} (${email.domain}) [${label}]`, sent, total: queue.length });
     } catch (e) {
@@ -2196,7 +2469,6 @@ interface LeadRow { id: number; name: string; email: string; company: string | n
 
 const BROKERS = [
   { name: 'MediaOptions', website: 'mediaoptions.com', specialty: 'premium brandable domains $2k–$500k, strong end-user buyer network' },
-  { name: 'DomainAgents', website: 'domainagents.com', specialty: 'professional brokerage with buyer/seller matching' },
   { name: 'Grit Brokerage', website: 'gritbrokerage.com', specialty: 'emerging brandable domains, startup-focused buyers' },
   { name: 'Sedo Brokerage', website: 'sedo.com', specialty: "world's largest domain marketplace, global buyer network" },
 ];

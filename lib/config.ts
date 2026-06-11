@@ -6,6 +6,7 @@ export const config = {
   googleClientId: process.env.GOOGLE_CLIENT_ID ?? '',
   googleClientSecret: process.env.GOOGLE_CLIENT_SECRET ?? '',
   fromName: process.env.FROM_NAME ?? '',
+  reportEmail: process.env.REPORT_EMAIL ?? process.env.FROM_EMAIL ?? '',
   dailySendLimit: parseInt(process.env.DAILY_SEND_LIMIT ?? '50'),
   leadScoreThreshold: parseInt(process.env.LEAD_SCORE_THRESHOLD ?? '60'),
   model: 'claude-sonnet-4-20250514' as const,

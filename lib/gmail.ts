@@ -23,6 +23,7 @@ export function getAuthUrl(): string {
     prompt: 'consent',
     scope: [
       'https://www.googleapis.com/auth/gmail.send',
+      'https://www.googleapis.com/auth/gmail.readonly',
       'https://www.googleapis.com/auth/userinfo.email',
     ],
   });
@@ -62,12 +63,13 @@ export async function disconnectAccount(): Promise<void> {
 }
 
 function buildRawMessage(opts: {
-  from: string; to: string; subject: string; body: string;
+  from: string; to: string; subject: string; body: string; inReplyTo?: string;
 }): string {
   const lines = [
     `From: ${opts.from}`,
     `To: ${opts.to}`,
     `Subject: ${opts.subject}`,
+    ...(opts.inReplyTo ? [`In-Reply-To: ${opts.inReplyTo}`, `References: ${opts.inReplyTo}`] : []),
     'MIME-Version: 1.0',
     'Content-Type: text/plain; charset=UTF-8',
     '',
@@ -76,9 +78,7 @@ function buildRawMessage(opts: {
   return Buffer.from(lines.join('\r\n')).toString('base64url');
 }
 
-export async function sendViaGmail(opts: {
-  to: string; subject: string; body: string;
-}): Promise<void> {
+async function getGmailClient() {
   const rows = await sql`SELECT email, access_token, refresh_token, token_expiry FROM gmail_accounts LIMIT 1`;
   const account = rows[0] as GmailAccount | undefined;
   if (!account) throw new Error('No Gmail account connected — connect one in the dashboard first.');
@@ -101,15 +101,68 @@ export async function sendViaGmail(opts: {
     }
   });
 
+  return { gmail: google.gmail({ version: 'v1', auth: client }), account };
+}
+
+export async function sendViaGmail(opts: {
+  to: string; subject: string; body: string; threadId?: string; inReplyTo?: string;
+}): Promise<void> {
+  const { gmail, account } = await getGmailClient();
+
   const fromHeader = config.fromName
     ? `"${config.fromName}" <${account.email}>`
     : account.email;
 
-  const gmail = google.gmail({ version: 'v1', auth: client });
   await gmail.users.messages.send({
     userId: 'me',
     requestBody: {
-      raw: buildRawMessage({ from: fromHeader, to: opts.to, subject: opts.subject, body: opts.body }),
+      raw: buildRawMessage({ from: fromHeader, to: opts.to, subject: opts.subject, body: opts.body, inReplyTo: opts.inReplyTo }),
+      ...(opts.threadId ? { threadId: opts.threadId } : {}),
     },
   });
+}
+
+export interface InboundEmail {
+  messageId: string;
+  threadId: string;
+  rfcMessageId: string;
+  from: string;
+  subject: string;
+  snippet: string;
+  receivedAt: Date;
+}
+
+export async function fetchRecentInboundEmails(sinceDays: number): Promise<InboundEmail[]> {
+  const { gmail, account } = await getGmailClient();
+
+  const list = await gmail.users.messages.list({
+    userId: 'me',
+    q: `in:inbox newer_than:${sinceDays}d`,
+    maxResults: 100,
+  });
+
+  const out: InboundEmail[] = [];
+  for (const m of list.data.messages ?? []) {
+    const msg = await gmail.users.messages.get({
+      userId: 'me',
+      id: m.id!,
+      format: 'metadata',
+      metadataHeaders: ['From', 'Subject', 'Message-ID'],
+    });
+    const headers = msg.data.payload?.headers ?? [];
+    const h = (name: string) => headers.find(x => x.name?.toLowerCase() === name.toLowerCase())?.value ?? '';
+    const fromRaw = h('From');
+    const from = (fromRaw.match(/<([^>]+)>/)?.[1] ?? fromRaw).trim().toLowerCase();
+    if (!from || from === account.email.toLowerCase()) continue;
+    out.push({
+      messageId: m.id!,
+      threadId: msg.data.threadId ?? '',
+      rfcMessageId: h('Message-ID'),
+      from,
+      subject: h('Subject'),
+      snippet: msg.data.snippet ?? '',
+      receivedAt: msg.data.internalDate ? new Date(Number(msg.data.internalDate)) : new Date(),
+    });
+  }
+  return out;
 }

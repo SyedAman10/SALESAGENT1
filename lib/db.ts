@@ -29,6 +29,20 @@ export async function initDb(): Promise<void> {
     enrichment TEXT,
     score INTEGER,
     status TEXT NOT NULL DEFAULT 'new',
+    tier INTEGER NOT NULL DEFAULT 2,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  )`;
+  await db`ALTER TABLE leads ADD COLUMN IF NOT EXISTS tier INTEGER NOT NULL DEFAULT 2`;
+  await db`CREATE TABLE IF NOT EXISTS replies (
+    id SERIAL PRIMARY KEY,
+    lead_id INTEGER NOT NULL REFERENCES leads(id),
+    gmail_message_id TEXT NOT NULL UNIQUE,
+    gmail_thread_id TEXT,
+    rfc_message_id TEXT,
+    from_email TEXT NOT NULL,
+    subject TEXT,
+    snippet TEXT,
+    received_at TIMESTAMPTZ NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
   )`;
   await db`CREATE TABLE IF NOT EXISTS lead_domain_matches (

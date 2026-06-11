@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { ingestLeads, enrichLeads, matchDomains, writeEmails, decideAndApprove, analyzeDomains, writeFollowUps, testApifyApollo, findHotLeads, testNewSources, findUpgradeBuyers, findCompanyNameMatches } from '@/lib/pipeline';
+import { ingestLeads, enrichLeads, matchDomains, writeEmails, decideAndApprove, analyzeDomains, writeFollowUps, testApifyApollo, findHotLeads, testNewSources, findUpgradeBuyers, findCompanyNameMatches, syncReplies, writeClosingFollowUps, generateDailyReport } from '@/lib/pipeline';
 
 export const maxDuration = 300;
 
@@ -36,6 +36,18 @@ export async function POST(req: NextRequest) {
       case 'sequence': {
         const result = await writeFollowUps();
         return NextResponse.json({ ok: true, ...result });
+      }
+      case 'replies': {
+        const result = await syncReplies();
+        return NextResponse.json({ ok: !result.error, ...result });
+      }
+      case 'closing': {
+        const result = await writeClosingFollowUps();
+        return NextResponse.json({ ok: true, ...result });
+      }
+      case 'report': {
+        const report = await generateDailyReport();
+        return NextResponse.json({ ok: true, report });
       }
       case 'hot': {
         const result = await findHotLeads(domains);
