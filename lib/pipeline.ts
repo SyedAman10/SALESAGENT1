@@ -1456,10 +1456,17 @@ export async function findUpgradeBuyers(targetDomains?: string[]): Promise<{
 
   for (const asset of portfolio) {
     const baseName = asset.domain.replace(/\.(com|net|org|io|co|club|app|us|biz|info)$/i, '');
-    const candidates = [
+    // TLD variants + the prefix/suffix patterns real businesses settle for when
+    // the clean .com is taken (getX, joinX, X-app, Xhq, hyphenated, keyword TLD split)
+    const wordSplit = baseName.replace(/([a-z])(club|app|hub|lab|labs|shop|store)$/i, '$1.$2');
+    const candidates = [...new Set([
       `${baseName}.net`, `${baseName}.co`, `${baseName}.org`, `${baseName}.club`,
       `${baseName}.io`, `${baseName}.app`, `${baseName}.us`, `${baseName}.biz`,
-    ];
+      `get${baseName}.com`, `join${baseName}.com`, `try${baseName}.com`, `my${baseName}.com`,
+      `${baseName}app.com`, `${baseName}hq.com`,
+      ...(wordSplit !== baseName ? [wordSplit] : []),
+      ...(baseName.length > 8 ? [baseName.replace(/([a-z]{4,})(club|app|hub|lab)$/i, '$1-$2') + '.com'].filter(c => c !== `${baseName}.com`) : []),
+    ])];
     breakdown['checked'] += candidates.length;
 
     for (const candidate of candidates) {
@@ -2972,6 +2979,32 @@ export async function getVariantPerformance() {
   }));
 }
 
+// ── REDDIT WTB ────────────────────────────────────────────────────────────────
+// People publicly posting "want to buy a domain" — highest free intent there is.
+// Uses the existing Reddit JSON scraper with keywords from the domain analyses.
+
+export async function redditWtbLeads(targetDomains?: string[]): Promise<{ inserted: number; skipped: number; found: number; error?: string }> {
+  const portfolio = loadPortfolio(targetDomains);
+  const kwSet = new Set<string>();
+  for (const asset of portfolio) {
+    const base = asset.domain.split('.')[0].toLowerCase();
+    kwSet.add(base);
+    const suffix = base.match(/(club|app|hub|lab|shop|store)$/i)?.[1];
+    if (suffix) { kwSet.add(suffix); kwSet.add(base.slice(0, -suffix.length)); }
+    const analysis = await getDomainAnalysis(asset.domain);
+    if (analysis) {
+      [...analysis.industries, ...analysis.use_cases]
+        .flatMap(s => s.toLowerCase().split(/[\s,/&]+/))
+        .filter(w => w.length > 3)
+        .slice(0, 20)
+        .forEach(w => kwSet.add(w));
+    }
+  }
+  const { leads, error } = await scrapeRedditJSON(kwSet);
+  const { inserted, skipped } = await upsertLeads(leads);
+  return { inserted, skipped, found: leads.length, error };
+}
+
 // ── DAILY INGEST CHAIN ────────────────────────────────────────────────────────
 // Time-budgeted front-of-funnel run for cron: find fresh buyers for closing-mode
 // domains, then enrich → match → write → decide. Every step is resumable, so
@@ -2993,6 +3026,7 @@ export async function runDailyIngestChain(budgetMs = 270000): Promise<Record<str
   if (left() > 90000) out.upgrade = await findUpgradeBuyers(targets);
   if (left() > 90000) out.namematch = await findCompanyNameMatches(targets);
   if (left() > 90000) out.triggers = await findTriggerLeads(targets).catch(e => ({ error: (e as Error).message }));
+  if (left() > 90000) out.reddit = await redditWtbLeads(targets).catch(e => ({ error: (e as Error).message }));
   if (left() > 90000) out.enrich = await enrichLeads();
   if (left() > 60000) out.match = await matchDomains(targets);
   if (left() > 40000) out.write = await writeEmails(left() - 20000);

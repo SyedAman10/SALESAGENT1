@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { ingestLeads, enrichLeads, matchDomains, writeEmails, decideAndApprove, analyzeDomains, writeFollowUps, testApifyApollo, findHotLeads, testNewSources, findUpgradeBuyers, findCompanyNameMatches, syncReplies, writeClosingFollowUps, generateDailyReport, findTriggerLeads, auditLostDeals, computeDomainMetrics, markIgnoredOutcomes, getBrokerInterestReport, scrapeCompSales, getBuyerBook, writeWarmFirstEmails, extractChatIntent, getVariantPerformance } from '@/lib/pipeline';
+import { ingestLeads, enrichLeads, matchDomains, writeEmails, decideAndApprove, analyzeDomains, writeFollowUps, testApifyApollo, findHotLeads, testNewSources, findUpgradeBuyers, findCompanyNameMatches, syncReplies, writeClosingFollowUps, generateDailyReport, findTriggerLeads, auditLostDeals, computeDomainMetrics, markIgnoredOutcomes, getBrokerInterestReport, scrapeCompSales, getBuyerBook, writeWarmFirstEmails, extractChatIntent, getVariantPerformance, redditWtbLeads } from '@/lib/pipeline';
 
 export const maxDuration = 300;
 
@@ -88,6 +88,10 @@ export async function POST(req: NextRequest) {
       case 'variants': {
         const result = await getVariantPerformance();
         return NextResponse.json({ ok: true, variants: result });
+      }
+      case 'reddit': {
+        const result = await redditWtbLeads(domains);
+        return NextResponse.json({ ok: true, ...result });
       }
       case 'hot': {
         const result = await findHotLeads(domains);
