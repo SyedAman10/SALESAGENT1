@@ -2640,10 +2640,20 @@ async function buildSendQueue(): Promise<SendItem[]> {
     WHERE e.status = 'approved' AND e.sequence_day > 1 AND l.status = 'contacted'
     ORDER BY l.tier ASC, l.score DESC
   ` as FollowUpRow[];
-  const dueFollowUps = dueFollowUpsAll.filter(e => {
-    if (!e.day1_sent) return false;
-    const daysPassed = (Date.now() - new Date(e.day1_sent as string).getTime()) / 86400000;
-    return daysPassed >= e.sequence_day - 1;
+  // Max one follow-up per lead per day — when day1 is old, several days become
+  // "due" at once and would otherwise all fire in the same run.
+  const due = dueFollowUpsAll
+    .filter(e => {
+      if (!e.day1_sent) return false;
+      const daysPassed = (Date.now() - new Date(e.day1_sent as string).getTime()) / 86400000;
+      return daysPassed >= e.sequence_day - 1;
+    })
+    .sort((a, b) => a.sequence_day - b.sequence_day);
+  const seenLead = new Set<number>();
+  const dueFollowUps = due.filter(e => {
+    if (seenLead.has(e.lead_id)) return false;
+    seenLead.add(e.lead_id);
+    return true;
   });
 
   return [...closing, ...day1, ...dueFollowUps];
