@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { ingestLeads, enrichLeads, matchDomains, writeEmails, decideAndApprove, analyzeDomains, writeFollowUps, testApifyApollo, findHotLeads, testNewSources, findUpgradeBuyers, findCompanyNameMatches, syncReplies, writeClosingFollowUps, generateDailyReport, findTriggerLeads, auditLostDeals, computeDomainMetrics, markIgnoredOutcomes, getBrokerInterestReport, scrapeCompSales, getBuyerBook, writeWarmFirstEmails } from '@/lib/pipeline';
+import { ingestLeads, enrichLeads, matchDomains, writeEmails, decideAndApprove, analyzeDomains, writeFollowUps, testApifyApollo, findHotLeads, testNewSources, findUpgradeBuyers, findCompanyNameMatches, syncReplies, writeClosingFollowUps, generateDailyReport, findTriggerLeads, auditLostDeals, computeDomainMetrics, markIgnoredOutcomes, getBrokerInterestReport, scrapeCompSales, getBuyerBook, writeWarmFirstEmails, extractChatIntent, getVariantPerformance } from '@/lib/pipeline';
 
 export const maxDuration = 300;
 
@@ -80,6 +80,14 @@ export async function POST(req: NextRequest) {
       case 'warmfirst': {
         const result = await writeWarmFirstEmails(domains);
         return NextResponse.json({ ok: true, ...result });
+      }
+      case 'intent': {
+        const result = await extractChatIntent();
+        return NextResponse.json({ ok: true, ...result });
+      }
+      case 'variants': {
+        const result = await getVariantPerformance();
+        return NextResponse.json({ ok: true, variants: result });
       }
       case 'hot': {
         const result = await findHotLeads(domains);

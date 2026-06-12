@@ -2525,6 +2525,21 @@ export async function generateDailyReport(): Promise<string> {
     }
   }
 
+  const intents = await sql`SELECT domain, email, budget_usd, summary FROM buyer_intent WHERE created_at > NOW() - INTERVAL '24 hours' ORDER BY created_at DESC LIMIT 10` as { domain: string; email: string | null; budget_usd: number | null; summary: string | null }[];
+  if (intents.length) {
+    lines.push('');
+    lines.push(`BUYER INTENT CAPTURED (last 24h): ${intents.length}`);
+    for (const i of intents) lines.push(`- ${i.domain}${i.email ? ` <${i.email}>` : ''}${i.budget_usd ? ` budget ~$${i.budget_usd.toLocaleString()}` : ''}: ${i.summary ?? ''}`);
+  }
+
+  const variants = await getVariantPerformance();
+  const withReplies = variants.filter(v => v.replied > 0);
+  if (withReplies.length) {
+    lines.push('');
+    lines.push('VARIANT PERFORMANCE (variants with replies):');
+    for (const v of withReplies) lines.push(`- ${v.variant} on ${v.domain}: ${v.replied}/${v.sent} replied (${v.reply_rate})`);
+  }
+
   const offers = await sql`SELECT domain, name, email, amount, status, created_at FROM storefront_offers WHERE created_at > NOW() - INTERVAL '24 hours' ORDER BY created_at DESC` as { domain: string; name: string | null; email: string; amount: number; status: string; created_at: string }[];
   if (offers.length) {
     lines.push('');
@@ -2827,7 +2842,9 @@ export async function getBuyerBook() {
       (SELECT string_agg(DISTINCT e.domain, ', ') FROM emails e WHERE e.lead_id = l.id AND e.status = 'sent') as pitched_domains,
       (SELECT MAX(r.received_at) FROM replies r WHERE r.lead_id = l.id) as last_reply_at,
       (SELECT MAX(o.amount) FROM storefront_offers o WHERE LOWER(o.email) = LOWER(l.email)) as best_offer,
-      (SELECT g.responder_type FROM engagement_log g WHERE g.lead_id = l.id AND g.responder_type IS NOT NULL ORDER BY g.created_at DESC LIMIT 1) as responder_type
+      (SELECT g.responder_type FROM engagement_log g WHERE g.lead_id = l.id AND g.responder_type IS NOT NULL ORDER BY g.created_at DESC LIMIT 1) as responder_type,
+      (SELECT bi.summary FROM buyer_intent bi WHERE bi.lead_id = l.id OR LOWER(bi.email) = LOWER(l.email) ORDER BY bi.created_at DESC LIMIT 1) as intent_summary,
+      (SELECT bi.budget_usd FROM buyer_intent bi WHERE bi.lead_id = l.id OR LOWER(bi.email) = LOWER(l.email) ORDER BY bi.created_at DESC LIMIT 1) as stated_budget
     FROM leads l
     WHERE l.status NOT IN ('blocked', 'unsubscribed', 'bounced')
       AND (
@@ -2877,6 +2894,82 @@ Return JSON only: {"subject": "...", "body": "..."}` }],
     }
   }
   return { written, skipped };
+}
+
+// ── CONVERSATIONAL INTENT (the data marketplaces can't collect) ───────────────
+// Mines storefront chat transcripts into structured buyer intent: budget,
+// timing, use case, objections. A marketplace knows someone searched "club
+// domains"; this knows they said "I'd do $3k if payment splits over two months".
+
+export async function extractChatIntent(): Promise<{ extracted: number; skipped: number }> {
+  type SessionRow = { session_id: string; domain: string };
+  const sessions = await sql`
+    SELECT DISTINCT c.session_id, c.domain
+    FROM storefront_chats c
+    WHERE NOT EXISTS (SELECT 1 FROM buyer_intent bi WHERE bi.source = 'chat' AND bi.ref_id = c.session_id)
+    GROUP BY c.session_id, c.domain
+    HAVING COUNT(*) FILTER (WHERE c.role = 'user') >= 2
+  ` as SessionRow[];
+
+  let extracted = 0; let skipped = 0;
+  for (const s of sessions) {
+    const msgs = await sql`SELECT role, content FROM storefront_chats WHERE session_id = ${s.session_id} ORDER BY id` as { role: string; content: string }[];
+    const transcript = msgs.map(m => `${m.role === 'user' ? 'BUYER' : 'AGENT'}: ${m.content}`).join('\n');
+    const email = transcript.match(/[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}/)?.[0]?.toLowerCase() ?? null;
+
+    try {
+      const res = await client.messages.create({
+        model: config.model, max_tokens: 400,
+        messages: [{ role: 'user', content: `Extract structured buyer intent from this domain-sale chat transcript.
+
+Domain discussed: ${s.domain}
+"""
+${transcript.slice(0, 4000)}
+"""
+
+Return JSON only (null for anything not stated):
+{"budget_usd": <number or null>, "timing": "when they'd buy, or null", "use_case": "what they'd build, or null", "objections": "their concerns/blockers, or null", "summary": "one sentence on where this buyer stands"}` }],
+      });
+      const text = res.content[0].type === 'text' ? res.content[0].text : '{}';
+      const intent = JSON.parse(text.replace(/```json\n?|\n?```/g, '').trim()) as { budget_usd: number | null; timing: string | null; use_case: string | null; objections: string | null; summary: string | null };
+      const leadRows = email ? await sql`SELECT id FROM leads WHERE LOWER(email) = ${email}` as { id: number }[] : [];
+      await sql`
+        INSERT INTO buyer_intent (source, ref_id, lead_id, email, domain, budget_usd, timing, use_case, objections, summary)
+        VALUES ('chat', ${s.session_id}, ${leadRows[0]?.id ?? null}, ${email}, ${s.domain}, ${intent.budget_usd}, ${intent.timing}, ${intent.use_case}, ${intent.objections}, ${intent.summary})
+        ON CONFLICT (source, ref_id) DO NOTHING`;
+      extracted++;
+    } catch { skipped++; }
+    await sleep(300);
+  }
+  return { extracted, skipped };
+}
+
+// ── VARIANT PERFORMANCE (the experiment loop) ─────────────────────────────────
+// Which pitch angles actually get replies, per domain. Reads the engagement the
+// system already records — no extra instrumentation.
+
+export async function getVariantPerformance() {
+  const rows = await sql`
+    SELECT e.variant, e.domain, COUNT(*) as sent,
+      COUNT(DISTINCT e.lead_id) FILTER (
+        WHERE EXISTS (SELECT 1 FROM replies r WHERE r.lead_id = e.lead_id AND r.received_at > e.sent_at)
+      ) as replied,
+      COUNT(DISTINCT e.lead_id) FILTER (
+        WHERE EXISTS (SELECT 1 FROM leads l2 WHERE l2.id = e.lead_id AND l2.status = 'unsubscribed')
+      ) as unsubscribed
+    FROM emails e
+    WHERE e.status = 'sent'
+    GROUP BY e.variant, e.domain
+    ORDER BY sent DESC` as { variant: string; domain: string; sent: string | number; replied: string | number; unsubscribed: string | number }[];
+
+  return rows.map(r => ({
+    variant: r.variant,
+    domain: r.domain,
+    sent: Number(r.sent),
+    replied: Number(r.replied),
+    unsubscribed: Number(r.unsubscribed),
+    reply_rate: Number(r.sent) ? `${(100 * Number(r.replied) / Number(r.sent)).toFixed(1)}%` : '0%',
+  }));
 }
 
 // ── DAILY INGEST CHAIN ────────────────────────────────────────────────────────

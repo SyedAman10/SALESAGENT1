@@ -98,6 +98,21 @@ export async function initDb(): Promise<void> {
     estimated_value_usd INTEGER,
     computed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
   )`;
+  await db`CREATE TABLE IF NOT EXISTS buyer_intent (
+    id SERIAL PRIMARY KEY,
+    source TEXT NOT NULL,
+    ref_id TEXT NOT NULL,
+    lead_id INTEGER REFERENCES leads(id),
+    email TEXT,
+    domain TEXT NOT NULL,
+    budget_usd INTEGER,
+    timing TEXT,
+    use_case TEXT,
+    objections TEXT,
+    summary TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE(source, ref_id)
+  )`;
   await db`CREATE TABLE IF NOT EXISTS comp_sales (
     id SERIAL PRIMARY KEY,
     domain TEXT NOT NULL UNIQUE,

@@ -65,6 +65,8 @@ The missing "demand capture" half of the agent — what Afternic/Sedo/Atom provi
 |---|---|
 | **Buyer book** — every engaged contact (replies, storefront chats, offers) accumulates into a reusable cross-domain clientele; new domains pitch warm contacts before any cold lead; registrar/marketplace employees auto-excluded | ✅ Live (2026-06-12) |
 | **Aftermarket comp sales ingestion** — real sales scraped daily from public charts (DNJournal); feeds domain analysis, negotiation copy, and audit price checks with observed market data instead of model memory. 30 comps on first run; grows daily | ✅ Live (2026-06-12) |
+| **Conversational intent mining** — storefront chat transcripts are distilled by AI into structured buyer intent (budget, timing, use case, objections) attached to the buyer book; surfaces in the daily report. This is data marketplace funnels structurally cannot collect | ✅ Live (2026-06-12) |
+| **Variant performance report** — reply and unsubscribe rates per pitch angle per domain, computed from existing engagement data. First read: the "direct" pitch style drove 0 replies and the most unsubscribes; "curious" performed best — the experiment loop the strategy doc called for | ✅ Live (2026-06-12) |
 | USPTO trademark-filing triggers (exact-match against portfolio = highest-intent lead that exists) | 🔴 Blocked — USPTO's new search API is undocumented/unstable; revisit via TSDR API key or bulk data files |
 | Escrow.com API integration — removes the last manual step in the money path | Planned (needs account) |
 | Platform nameservers for zero-touch domain onboarding at scale | Planned |
