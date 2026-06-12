@@ -2036,16 +2036,31 @@ Return valid JSON only.`;
 // Pulls recent inbound Gmail messages and matches them to known leads.
 // Requires the Gmail account to be connected with the gmail.readonly scope.
 
-export async function syncReplies(sinceDays = 7): Promise<{ scanned: number; matched: number; error?: string }> {
+export async function syncReplies(sinceDays = 7): Promise<{ scanned: number; matched: number; bounced: number; error?: string }> {
   let inbound;
   try {
     inbound = await fetchRecentInboundEmails(sinceDays);
   } catch (e) {
-    return { scanned: 0, matched: 0, error: `${(e as Error).message} — reconnect Gmail in the dashboard to grant read access` };
+    return { scanned: 0, matched: 0, bounced: 0, error: `${(e as Error).message} — reconnect Gmail in the dashboard to grant read access` };
   }
 
   let matched = 0;
+  let bounced = 0;
   for (const msg of inbound) {
+    // Bounce detection: mailer-daemon notices name the dead address in the snippet.
+    // Bounced leads exit every queue — bounce rate is what kills Gmail sender reputation.
+    if (/^(mailer-daemon|postmaster)@/i.test(msg.from) || /delivery status notification|address not found|wasn't delivered|undeliver/i.test(msg.subject)) {
+      const deadEmails = (`${msg.subject} ${msg.snippet}`.match(/[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}/g) ?? [])
+        .filter(e => !/^(mailer-daemon|postmaster)@/i.test(e));
+      for (const dead of [...new Set(deadEmails)]) {
+        const rows = await sql`UPDATE leads SET status = 'bounced' WHERE LOWER(email) = ${dead.toLowerCase()} AND status NOT IN ('blocked') RETURNING id` as { id: number }[];
+        if (rows.length) {
+          bounced++;
+          await sql`UPDATE emails SET status = 'rejected' WHERE lead_id = ${rows[0].id} AND status IN ('pending', 'approved')`;
+        }
+      }
+      continue;
+    }
     const rows = await sql`SELECT id, status FROM leads WHERE LOWER(email) = ${msg.from}` as { id: number; status: string }[];
     const lead = rows[0];
     if (!lead) continue;
@@ -2061,7 +2076,7 @@ export async function syncReplies(sinceDays = 7): Promise<{ scanned: number; mat
     // Product system: every reply becomes a structured engagement data point
     await logEngagement(lead.id, (ins[0] as { id: number }).id, msg).catch(e => console.error('[engagement]', (e as Error).message));
   }
-  return { scanned: inbound.length, matched };
+  return { scanned: inbound.length, matched, bounced };
 }
 
 // ── ENGAGEMENT LOG (Dataset 1) ────────────────────────────────────────────────
