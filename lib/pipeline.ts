@@ -1443,6 +1443,46 @@ async function checkDomainLive(domain: string): Promise<boolean> {
   return false;
 }
 
+// RDAP: who holds a domain variant — registration age is the buying signal
+async function rdapLookup(domain: string): Promise<{ registered: boolean; registrar?: string; registeredOn?: string; expiresOn?: string }> {
+  try {
+    const res = await axios.get(`https://rdap.org/domain/${domain}`, {
+      timeout: 10000,
+      headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' },
+    });
+    const data = res.data as { events?: { eventAction: string; eventDate: string }[]; entities?: { roles?: string[]; vcardArray?: [string, [string, object, string, string][]] }[] };
+    const ev = (action: string) => data.events?.find(e => e.eventAction === action)?.eventDate;
+    const registrarEntity = data.entities?.find(e => e.roles?.includes('registrar'));
+    const registrar = registrarEntity?.vcardArray?.[1]?.find(x => x[0] === 'fn')?.[3];
+    return { registered: true, registrar, registeredOn: ev('registration'), expiresOn: ev('expiration') };
+  } catch {
+    return { registered: false };
+  }
+}
+
+// Privacy-protected variant holders can only be reached via registrar relay forms.
+// Automating the submission violates registrar ToS, so the agent does everything
+// except the final click: RDAP enrichment, relay link, drafted message — surfaced
+// in the daily report as a 60-second manual task.
+async function upsertRelayLead(variant: string, asset: Asset, rdap: { registrar?: string; registeredOn?: string; expiresOn?: string }, isLive: boolean): Promise<boolean> {
+  const relayUrl = rdap.registrar?.toLowerCase().includes('godaddy')
+    ? `https://www.godaddy.com/whois/results.aspx?domain=${variant}&action=contactDomainOwner`
+    : `https://who.is/whois/${variant}`;
+  const heldSince = rdap.registeredOn ? new Date(rdap.registeredOn).getFullYear() : null;
+  const storefront = config.baseUrl.includes('localhost') ? '' : ` Details or direct offers: ${config.baseUrl}/buy/${asset.domain}.`;
+  const message = `Subject: ${asset.domain} — offering it to you first\n\nHi — I own ${asset.domain}. I noticed you've held ${variant}${heldSince ? ` since ${heldSince}` : ''}, so I wanted to offer you the matching domain before I sell it elsewhere. It's listed at $${asset.asking_price.toLocaleString()}.${storefront} If it's not for you, no worries.\n\n${config.fromName}`;
+
+  const rows = await sql`
+    INSERT INTO relay_leads (variant_domain, target_domain, registrar, registered_on, expires_on, is_live, relay_url, suggested_message)
+    VALUES (${variant}, ${asset.domain}, ${rdap.registrar ?? null}, ${rdap.registeredOn ?? null}, ${rdap.expiresOn ?? null}, ${isLive}, ${relayUrl}, ${message})
+    ON CONFLICT (variant_domain) DO NOTHING RETURNING id`;
+  return rows.length > 0;
+}
+
+export async function getRelayLeads(status = 'pending') {
+  return await sql`SELECT * FROM relay_leads WHERE status = ${status} ORDER BY is_live DESC, created_at DESC`;
+}
+
 export async function findUpgradeBuyers(targetDomains?: string[]): Promise<{
   inserted: number; skipped: number; liveVariants: string[];
   breakdown: Record<string, number>; errors: Record<string, string>;
@@ -1451,7 +1491,7 @@ export async function findUpgradeBuyers(targetDomains?: string[]): Promise<{
   const allLeads: RawLead[] = [];
   const seen = new Set<string>();
   const liveVariants: string[] = [];
-  const breakdown: Record<string, number> = { 'checked': 0, 'live': 0, 'apollo': 0, 'contact': 0 };
+  const breakdown: Record<string, number> = { 'checked': 0, 'live': 0, 'apollo': 0, 'contact': 0, 'relay': 0 };
   const errors: Record<string, string> = {};
 
   for (const asset of portfolio) {
@@ -1472,7 +1512,13 @@ export async function findUpgradeBuyers(targetDomains?: string[]): Promise<{
     for (const candidate of candidates) {
       let isLive = false;
       try { isLive = await checkDomainLive(candidate); } catch { /* skip */ }
-      if (!isLive) { await sleep(300); continue; }
+      if (!isLive) {
+        // Not serving a site, but possibly registered and held — relay lead if so
+        const rdap = await rdapLookup(candidate);
+        if (rdap.registered && await upsertRelayLead(candidate, asset, rdap, false)) breakdown['relay']++;
+        await sleep(300);
+        continue;
+      }
 
       breakdown['live']++;
       liveVariants.push(candidate);
@@ -1508,6 +1554,12 @@ export async function findUpgradeBuyers(targetDomains?: string[]): Promise<{
             });
           }
         } catch (e) { errors[`contact:${candidate}`] = (e as Error).message; }
+      }
+
+      // Live site, owner unreachable by email — registrar relay is the path
+      if (!allLeads.some(l => (l.raw_data as Record<string, string>)?.upgrade_from === candidate)) {
+        const rdap = await rdapLookup(candidate);
+        if (rdap.registered && await upsertRelayLead(candidate, asset, rdap, true)) breakdown['relay']++;
       }
 
       await sleep(500);
@@ -2529,6 +2581,19 @@ export async function generateDailyReport(): Promise<string> {
     if (pending.length) {
       lines.push(`AWAITING YOUR APPROVAL (${pending.length}):`);
       for (const p of pending) lines.push(`- #${p.id} [${p.variant}] to ${p.email}: "${p.subject}"`);
+    }
+  }
+
+  type RelayRow = { variant_domain: string; target_domain: string; registered_on: string | null; is_live: boolean; relay_url: string; suggested_message: string };
+  const relays = await sql`SELECT variant_domain, target_domain, registered_on, is_live, relay_url, suggested_message FROM relay_leads WHERE status = 'pending' ORDER BY is_live DESC, created_at DESC LIMIT 5` as RelayRow[];
+  if (relays.length) {
+    lines.push('');
+    lines.push(`REGISTRANT RELAY LEADS — manual, ~60s each (${relays.length} pending):`);
+    for (const r of relays) {
+      const held = r.registered_on ? ` (held since ${new Date(r.registered_on).getFullYear()})` : '';
+      lines.push(`- ${r.variant_domain}${held}${r.is_live ? ' [LIVE SITE]' : ''} → owner is a prospect for ${r.target_domain}`);
+      lines.push(`  Relay form: ${r.relay_url}`);
+      lines.push(`  Message to paste:\n  ${r.suggested_message.split('\n').join('\n  ')}`);
     }
   }
 

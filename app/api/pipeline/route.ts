@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { ingestLeads, enrichLeads, matchDomains, writeEmails, decideAndApprove, analyzeDomains, writeFollowUps, testApifyApollo, findHotLeads, testNewSources, findUpgradeBuyers, findCompanyNameMatches, syncReplies, writeClosingFollowUps, generateDailyReport, findTriggerLeads, auditLostDeals, computeDomainMetrics, markIgnoredOutcomes, getBrokerInterestReport, scrapeCompSales, getBuyerBook, writeWarmFirstEmails, extractChatIntent, getVariantPerformance, redditWtbLeads } from '@/lib/pipeline';
+import { ingestLeads, enrichLeads, matchDomains, writeEmails, decideAndApprove, analyzeDomains, writeFollowUps, testApifyApollo, findHotLeads, testNewSources, findUpgradeBuyers, findCompanyNameMatches, syncReplies, writeClosingFollowUps, generateDailyReport, findTriggerLeads, auditLostDeals, computeDomainMetrics, markIgnoredOutcomes, getBrokerInterestReport, scrapeCompSales, getBuyerBook, writeWarmFirstEmails, extractChatIntent, getVariantPerformance, redditWtbLeads, getRelayLeads } from '@/lib/pipeline';
 
 export const maxDuration = 300;
 
@@ -92,6 +92,10 @@ export async function POST(req: NextRequest) {
       case 'reddit': {
         const result = await redditWtbLeads(domains);
         return NextResponse.json({ ok: true, ...result });
+      }
+      case 'relays': {
+        const result = await getRelayLeads();
+        return NextResponse.json({ ok: true, count: result.length, relays: result });
       }
       case 'hot': {
         const result = await findHotLeads(domains);
