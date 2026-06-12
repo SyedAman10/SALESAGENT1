@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { ingestLeads, enrichLeads, matchDomains, writeEmails, decideAndApprove, analyzeDomains, writeFollowUps, testApifyApollo, findHotLeads, testNewSources, findUpgradeBuyers, findCompanyNameMatches, syncReplies, writeClosingFollowUps, generateDailyReport, findTriggerLeads, auditLostDeals, computeDomainMetrics, markIgnoredOutcomes, getBrokerInterestReport } from '@/lib/pipeline';
+import { ingestLeads, enrichLeads, matchDomains, writeEmails, decideAndApprove, analyzeDomains, writeFollowUps, testApifyApollo, findHotLeads, testNewSources, findUpgradeBuyers, findCompanyNameMatches, syncReplies, writeClosingFollowUps, generateDailyReport, findTriggerLeads, auditLostDeals, computeDomainMetrics, markIgnoredOutcomes, getBrokerInterestReport, scrapeCompSales, getBuyerBook, writeWarmFirstEmails } from '@/lib/pipeline';
 
 export const maxDuration = 300;
 
@@ -67,6 +67,18 @@ export async function POST(req: NextRequest) {
       }
       case 'broker-report': {
         const result = await getBrokerInterestReport();
+        return NextResponse.json({ ok: true, ...result });
+      }
+      case 'comps': {
+        const result = await scrapeCompSales();
+        return NextResponse.json({ ok: !result.error, ...result });
+      }
+      case 'buyerbook': {
+        const book = await getBuyerBook();
+        return NextResponse.json({ ok: true, count: book.length, book });
+      }
+      case 'warmfirst': {
+        const result = await writeWarmFirstEmails(domains);
         return NextResponse.json({ ok: true, ...result });
       }
       case 'hot': {

@@ -29,6 +29,15 @@ export async function getAnalysisSummary(domain: string): Promise<{ one_liner: s
   return { one_liner: a.one_liner, value_props: a.value_props ?? [], comparable_sales: a.comparable_sales ?? [] };
 }
 
+async function upsertEngagedContact(email: string, name: string, source: string, context: object): Promise<void> {
+  await sql`
+    INSERT INTO leads (name, email, company, linkedin_url, source, raw_data, status, tier)
+    VALUES (${name}, ${email.toLowerCase()}, ${null}, ${null}, ${source}, ${JSON.stringify(context)}, 'replied', 1)
+    ON CONFLICT (email) DO UPDATE SET
+      status = CASE WHEN leads.status IN ('blocked', 'unsubscribed', 'bounced') THEN leads.status ELSE 'replied' END,
+      tier = 1`;
+}
+
 async function alert(subject: string, body: string): Promise<void> {
   if (!config.reportEmail) return;
   try { await sendViaGmail({ to: config.reportEmail, subject, body }); }
@@ -63,6 +72,9 @@ export async function evaluateOffer(input: { domain: string; name?: string; emai
     INSERT INTO storefront_offers (domain, name, email, amount, message, status, agent_response)
     VALUES (${input.domain}, ${input.name ?? null}, ${input.email}, ${input.amount}, ${input.message ?? null}, ${status}, ${response})
     RETURNING id`;
+
+  // Buyer book: anyone who makes an offer is a proven domain buyer — keep them forever
+  await upsertEngagedContact(input.email, input.name ?? input.email.split('@')[0], 'storefront:offer', { domain: input.domain, amount: input.amount });
 
   await alert(
     `[OFFER ${status.toUpperCase()}] $${input.amount.toLocaleString()} for ${input.domain}`,
@@ -122,6 +134,12 @@ Negotiation rules (hard):
   }
 
   await sql`INSERT INTO storefront_chats (session_id, domain, role, content) VALUES (${sessionId}, ${domain}, 'assistant', ${reply})`;
+
+  // Buyer book: capture any email the visitor shares in chat
+  const sharedEmail = userMessage.match(/[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}/)?.[0];
+  if (sharedEmail) {
+    await upsertEngagedContact(sharedEmail, sharedEmail.split('@')[0], 'storefront:chat', { domain, sessionId }).catch(() => { /* non-fatal */ });
+  }
 
   if (OFFER_HINT_RE.test(userMessage)) {
     await alert(

@@ -1715,11 +1715,12 @@ export async function analyzeDomains(targetDomains?: string[]): Promise<{ analyz
     const existing = await sql`SELECT id FROM domain_analyses WHERE domain = ${asset.domain}`;
     if (existing.length) { skipped++; continue; }
 
+    const realComps = await getRelevantComps(asset.domain, asset.asking_price).catch(() => [] as string[]);
     try {
       const res = await client.messages.create({
         model: config.model,
         max_tokens: 800,
-        messages: [{ role: 'user', content: domainAnalysisPrompt(asset) }],
+        messages: [{ role: 'user', content: domainAnalysisPrompt(asset, realComps) }],
       });
 
       const text = res.content[0].type === 'text' ? res.content[0].text : '';
@@ -1734,13 +1735,13 @@ export async function analyzeDomains(targetDomains?: string[]): Promise<{ analyz
   return { analyzed, skipped };
 }
 
-function domainAnalysisPrompt(asset: Asset): string {
+function domainAnalysisPrompt(asset: Asset, realComps: string[] = []): string {
   return `You are a domain name expert and sales strategist. Deeply analyse this domain and generate actionable sales intelligence.
 
 Domain: ${asset.domain}
 Category: ${asset.category}
 Asking price: $${asset.asking_price.toLocaleString()}
-Description: ${asset.description}
+Description: ${asset.description}${realComps.length ? `\nVerified recent aftermarket sales (use these as comparable_sales — they are real): ${realComps.join('; ')}` : ''}
 
 Think about:
 - What the name sounds like, its linguistic feel, cultural associations
@@ -2200,6 +2201,7 @@ export async function auditLostDeals(limit = 20): Promise<{ audited: number; sum
   for (const t of targets) {
     const asset = portfolio.find(a => a.domain === t.domain);
     const analysis = await getDomainAnalysis(t.domain);
+    const realComps = asset ? await getRelevantComps(t.domain, asset.asking_price).catch(() => [] as string[]) : [];
     let role = '';
     try { role = (JSON.parse(t.raw_data) as { title?: string }).title ?? ''; } catch { /* ok */ }
     try {
@@ -2208,7 +2210,7 @@ export async function auditLostDeals(limit = 20): Promise<{ audited: number; sum
         messages: [{ role: 'user', content: `Audit this failed domain outreach (zero responses). Be brutally honest — the goal is to find why it failed.
 
 Domain: ${t.domain}, asking $${asset?.asking_price.toLocaleString() ?? '?'}
-Comparable sales: ${analysis?.comparable_sales.slice(0, 3).join('; ') ?? 'unknown'}
+Comparable sales: ${[...realComps, ...(analysis?.comparable_sales.slice(0, 2) ?? [])].slice(0, 4).join('; ') || 'unknown'}
 Contact: ${t.name}${role ? ` (${role})` : ''}${t.company ? ` at ${t.company}` : ''}, sourced from: ${t.source}
 Email sent:
 Subject: ${t.subject}
@@ -2625,10 +2627,17 @@ async function buildSendQueue(): Promise<SendItem[]> {
     ORDER BY l.tier ASC, l.score DESC
   ` as SendItem[];
 
+  const warmFirst = await sql`
+    SELECT e.id, e.lead_id, e.domain, e.subject, e.body, e.sequence_day, e.variant
+    FROM emails e INNER JOIN leads l ON l.id = e.lead_id
+    WHERE e.status = 'approved' AND e.variant = 'warmfirst' AND l.status NOT IN ('blocked', 'unsubscribed', 'bounced')
+    ORDER BY l.tier ASC, l.score DESC NULLS LAST
+  ` as SendItem[];
+
   const day1 = await sql`
     SELECT e.id, e.lead_id, e.domain, e.subject, e.body, e.sequence_day, e.variant
     FROM emails e INNER JOIN leads l ON l.id = e.lead_id
-    WHERE e.status = 'approved' AND e.sequence_day = 1 AND e.variant NOT LIKE 'closing%' AND l.status = 'enriched'
+    WHERE e.status = 'approved' AND e.sequence_day = 1 AND e.variant NOT IN ('warmfirst') AND e.variant NOT LIKE 'closing%' AND l.status = 'enriched'
     ORDER BY l.tier ASC, l.score DESC
   ` as SendItem[];
 
@@ -2656,7 +2665,7 @@ async function buildSendQueue(): Promise<SendItem[]> {
     return true;
   });
 
-  return [...closing, ...day1, ...dueFollowUps];
+  return [...closing, ...warmFirst, ...day1, ...dueFollowUps];
 }
 
 // Resolves the recipient and enforces the blacklist at the last line of defense.
@@ -2688,7 +2697,8 @@ async function dispatchEmail(email: SendItem, lead: { name: string; email: strin
 
   await sendViaGmail({ to: lead.email, subject: email.subject, body, threadId, inReplyTo });
   await sql`UPDATE emails SET status = 'sent', sent_at = NOW() WHERE id = ${email.id}`;
-  if (email.sequence_day === 1 && !isClosing) await sql`UPDATE leads SET status = 'contacted' WHERE id = ${email.lead_id}`;
+  // warmfirst recipients are already 'replied' — don't downgrade them to 'contacted'
+  if (email.sequence_day === 1 && !isClosing && email.variant !== 'warmfirst') await sql`UPDATE leads SET status = 'contacted' WHERE id = ${email.lead_id}`;
   await sql`INSERT INTO send_log (email_id, result) VALUES (${email.id}, 'ok')`;
 }
 
@@ -2740,6 +2750,135 @@ export async function sendApprovedStream(emit: Emitter): Promise<void> {
   emit({ type: 'summary', message: `Done — sent: ${sent} | failed: ${failed}`, sent, failed });
 }
 
+// ── COMP SALES ────────────────────────────────────────────────────────────────
+// Real aftermarket sales scraped from DNJournal's public charts. Replaces
+// "Claude remembers some comps" with observed market data for pricing and audits.
+
+export async function scrapeCompSales(): Promise<{ inserted: number; scanned: number; error?: string }> {
+  const urls = [
+    'https://www.dnjournal.com/ytd-sales-charts.htm',
+    'https://www.dnjournal.com/domainsales.htm',
+  ];
+  let inserted = 0; let scanned = 0;
+  const errors: string[] = [];
+
+  for (const url of urls) {
+    try {
+      const res = await axios.get(url, {
+        headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36' },
+        timeout: 15000,
+      });
+      const $ = cheerio.load(res.data as string);
+      const text = $('body').text();
+      // "domain.tld ... $123,456" pairs — venue is whatever sits between
+      const re = /\b([a-z0-9][a-z0-9-]{0,40}\.[a-z]{2,6})\b[^$\n]{0,60}?\$\s?([\d,]{3,12})/gi;
+      let m: RegExpExecArray | null;
+      while ((m = re.exec(text)) !== null) {
+        const domain = m[1].toLowerCase();
+        const price = parseInt(m[2].replace(/,/g, ''), 10);
+        if (!price || price < 100 || price > 100000000) continue;
+        if (/dnjournal|sitemap|\.(htm|html|php|asp)$/i.test(domain)) continue;
+        scanned++;
+        const rows = await sql`
+          INSERT INTO comp_sales (domain, price, venue, source)
+          VALUES (${domain}, ${price}, ${null}, 'dnjournal')
+          ON CONFLICT (domain) DO NOTHING RETURNING id`;
+        if (rows.length) inserted++;
+      }
+    } catch (e) { errors.push(`${url}: ${(e as Error).message}`); }
+    await sleep(800);
+  }
+  return { inserted, scanned, error: errors.length ? errors.join('; ') : undefined };
+}
+
+// Comps relevant to a domain: shared keywords first, then same TLD in a similar price band
+export async function getRelevantComps(domain: string, askingPrice: number): Promise<string[]> {
+  const base = domain.split('.')[0];
+  const words = base.replace(/([a-z])([A-Z])/g, '$1 $2').toLowerCase().split(/[-_]/).join(' ').split(' ');
+  const keywords = [...new Set([base, ...words.filter(w => w.length > 3)])];
+
+  const patterns = keywords.map(k => `%${k}%`);
+  const byKeyword = await sql`
+    SELECT domain, price FROM comp_sales
+    WHERE domain ILIKE ANY(${patterns})
+    ORDER BY ABS(price - ${askingPrice}) ASC LIMIT 4` as { domain: string; price: number }[];
+
+  const tld = domain.split('.').pop() ?? 'com';
+  const byBand = await sql`
+    SELECT domain, price FROM comp_sales
+    WHERE domain LIKE ${'%.' + tld} AND price BETWEEN ${Math.round(askingPrice * 0.3)} AND ${askingPrice * 10}
+    ORDER BY ABS(price - ${askingPrice}) ASC LIMIT 4` as { domain: string; price: number }[];
+
+  const seen = new Set<string>();
+  return [...byKeyword, ...byBand]
+    .filter(c => { if (seen.has(c.domain)) return false; seen.add(c.domain); return true; })
+    .slice(0, 5)
+    .map(c => `${c.domain} sold for $${c.price.toLocaleString()}`);
+}
+
+// ── BUYER BOOK ────────────────────────────────────────────────────────────────
+// The accumulating clientele: every contact who ever replied, chatted on a
+// storefront, or made an offer. New domains pitch these warm contacts first —
+// the same compounding asset brokers call their "buyer network".
+
+export async function getBuyerBook() {
+  return await sql`
+    SELECT l.id, l.name, l.email, l.company, l.source, l.status,
+      (SELECT string_agg(DISTINCT e.domain, ', ') FROM emails e WHERE e.lead_id = l.id AND e.status = 'sent') as pitched_domains,
+      (SELECT MAX(r.received_at) FROM replies r WHERE r.lead_id = l.id) as last_reply_at,
+      (SELECT MAX(o.amount) FROM storefront_offers o WHERE LOWER(o.email) = LOWER(l.email)) as best_offer,
+      (SELECT g.responder_type FROM engagement_log g WHERE g.lead_id = l.id AND g.responder_type IS NOT NULL ORDER BY g.created_at DESC LIMIT 1) as responder_type
+    FROM leads l
+    WHERE l.status NOT IN ('blocked', 'unsubscribed', 'bounced')
+      AND (
+        l.status = 'replied'
+        OR EXISTS (SELECT 1 FROM replies r WHERE r.lead_id = l.id)
+        OR EXISTS (SELECT 1 FROM storefront_offers o WHERE LOWER(o.email) = LOWER(l.email))
+        OR l.source LIKE 'storefront:%'
+      )
+    ORDER BY last_reply_at DESC NULLS LAST`;
+}
+
+// Pitch a domain to buyer-book contacts who haven't seen it yet — warm before cold.
+export async function writeWarmFirstEmails(targetDomains?: string[]): Promise<{ written: number; skipped: number }> {
+  const portfolio = loadPortfolio(targetDomains);
+  type BookRow = { id: number; name: string; email: string; company: string | null; source: string; responder_type: string | null; best_offer: number | null };
+  const book = await getBuyerBook() as BookRow[];
+  let written = 0; let skipped = 0;
+
+  for (const asset of portfolio) {
+    const analysis = await getDomainAnalysis(asset.domain);
+    for (const contact of book) {
+      // Skip registrar/marketplace employees — they're data, not buyers
+      if (contact.responder_type === 'registrar') { skipped++; continue; }
+      const already = await sql`SELECT id FROM emails WHERE lead_id = ${contact.id} AND domain = ${asset.domain}`;
+      if (already.length) { skipped++; continue; }
+
+      try {
+        const res = await client.messages.create({
+          model: config.model, max_tokens: 400,
+          messages: [{ role: 'user', content: `Write a short warm email to someone who previously engaged with us about buying a domain — they ${contact.source.startsWith('storefront') ? 'visited a sales page and ' + (contact.best_offer ? `made an offer of $${contact.best_offer.toLocaleString()}` : 'asked questions') : 'replied to an earlier email'}. Now a different domain they might like is available.
+
+Contact: ${contact.name}${contact.company ? ` @ ${contact.company}` : ''}
+New domain: ${asset.domain} — $${asset.asking_price.toLocaleString()}
+${analysis ? `Pitch: ${analysis.one_liner}` : `Description: ${asset.description}`}
+${config.baseUrl.includes('localhost') ? '' : `Link: ${config.baseUrl}/buy/${asset.domain}`}
+
+Rules: under 70 words, reference that you spoke before (warm, not cold), one low-friction CTA, include the link if provided, sign as ${config.fromName}, no fluff.
+
+Return JSON only: {"subject": "...", "body": "..."}` }],
+        });
+        const text = res.content[0].type === 'text' ? res.content[0].text : '';
+        const parsed = JSON.parse(text.replace(/```json\n?|\n?```/g, '').trim()) as { subject: string; body: string };
+        await sql`INSERT INTO emails (lead_id, domain, subject, body, variant, status, sequence_day) VALUES (${contact.id}, ${asset.domain}, ${parsed.subject}, ${parsed.body}, 'warmfirst', 'approved', 1)`;
+        written++;
+      } catch { skipped++; }
+      await sleep(300);
+    }
+  }
+  return { written, skipped };
+}
+
 // ── DAILY INGEST CHAIN ────────────────────────────────────────────────────────
 // Time-budgeted front-of-funnel run for cron: find fresh buyers for closing-mode
 // domains, then enrich → match → write → decide. Every step is resumable, so
@@ -2755,6 +2894,8 @@ export async function runDailyIngestChain(budgetMs = 270000): Promise<Record<str
 
   out.metrics = await computeDomainMetrics().catch(e => ({ error: (e as Error).message }));
   out.ignored = await markIgnoredOutcomes().catch(e => ({ error: (e as Error).message }));
+  out.comps = await scrapeCompSales().catch(e => ({ error: (e as Error).message }));
+  out.warmfirst = await writeWarmFirstEmails(targets).catch(e => ({ error: (e as Error).message }));
   out.ingest = await testNewSources(targets);
   if (left() > 90000) out.upgrade = await findUpgradeBuyers(targets);
   if (left() > 90000) out.namematch = await findCompanyNameMatches(targets);
