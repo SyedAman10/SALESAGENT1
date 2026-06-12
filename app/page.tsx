@@ -218,6 +218,26 @@ export default function Dashboard() {
     }
   }
 
+  const [goingLive, setGoingLive] = useState<string | null>(null);
+  async function goLiveDomain(domain: string) {
+    setGoingLive(domain);
+    setLog(prev => [...prev, `▶ Going live: attaching ${domain} to Vercel + setting DNS...`]);
+    try {
+      const res = await fetch('/api/domains/attach', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ domain }),
+      });
+      const data = await res.json() as { ok: boolean; summary?: string; error?: string; steps?: Record<string, string>; manual?: { type: string; host: string; value: string }[] };
+      setLog(prev => [...prev, `${data.ok ? '✓' : '✗'} ${domain}: ${data.summary ?? data.error}`]);
+      for (const [k, v] of Object.entries(data.steps ?? {})) setLog(prev => [...prev, `  · ${k}: ${v}`]);
+      if (data.manual) for (const r of data.manual) setLog(prev => [...prev, `  · set manually: ${r.type} ${r.host} → ${r.value}`]);
+    } catch (e) {
+      setLog(prev => [...prev, `✗ ${domain}: ${(e as Error).message}`]);
+    }
+    setGoingLive(null);
+  }
+
   async function confirmDomainPicker() {
     const action = pendingAction;
     const domains = [...new Set([...pickerSelected, ...pickerCustomDomains])];
@@ -770,6 +790,13 @@ export default function Dashboard() {
                     <div className="text-right flex-shrink-0 ml-4">
                       <p className="text-white text-sm font-semibold">${row.asking_price.toLocaleString()}</p>
                       <p className="text-gray-500 text-xs">{row.category}</p>
+                      <button
+                        onClick={() => goLiveDomain(row.domain)}
+                        disabled={goingLive !== null}
+                        className="mt-2 text-xs px-3 py-1.5 rounded bg-emerald-700 hover:bg-emerald-600 disabled:opacity-50 text-white font-medium"
+                      >
+                        {goingLive === row.domain ? 'Going live…' : '🌐 Go Live'}
+                      </button>
                     </div>
                   </div>
                   {row.analysis && (
