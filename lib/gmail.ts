@@ -62,13 +62,18 @@ export async function disconnectAccount(): Promise<void> {
   await sql`DELETE FROM gmail_accounts`;
 }
 
+// Email headers must be ASCII — RFC 2047 encode anything else (em-dashes, accents)
+function encodeHeader(value: string): string {
+  return /^[\x20-\x7E]*$/.test(value) ? value : `=?UTF-8?B?${Buffer.from(value, 'utf8').toString('base64')}?=`;
+}
+
 function buildRawMessage(opts: {
   from: string; to: string; subject: string; body: string; inReplyTo?: string;
 }): string {
   const lines = [
     `From: ${opts.from}`,
     `To: ${opts.to}`,
-    `Subject: ${opts.subject}`,
+    `Subject: ${encodeHeader(opts.subject)}`,
     ...(opts.inReplyTo ? [`In-Reply-To: ${opts.inReplyTo}`, `References: ${opts.inReplyTo}`] : []),
     'MIME-Version: 1.0',
     'Content-Type: text/plain; charset=UTF-8',
@@ -109,9 +114,11 @@ export async function sendViaGmail(opts: {
 }): Promise<void> {
   const { gmail, account } = await getGmailClient();
 
-  const fromHeader = config.fromName
-    ? `"${config.fromName}" <${account.email}>`
-    : account.email;
+  const fromHeader = !config.fromName
+    ? account.email
+    : /^[\x20-\x7E]*$/.test(config.fromName)
+      ? `"${config.fromName}" <${account.email}>`
+      : `${encodeHeader(config.fromName)} <${account.email}>`;
 
   await gmail.users.messages.send({
     userId: 'me',
