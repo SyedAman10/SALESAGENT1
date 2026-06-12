@@ -2584,6 +2584,13 @@ export async function generateDailyReport(): Promise<string> {
     }
   }
 
+  const dmTasks = await sql`SELECT channel, url, handle, title FROM dm_tasks WHERE status = 'pending' ORDER BY created_at DESC LIMIT 5` as { channel: string; url: string; handle: string | null; title: string | null }[];
+  if (dmTasks.length) {
+    lines.push('');
+    lines.push(`DM TASKS — manual outreach (${dmTasks.length} pending):`);
+    for (const t of dmTasks) lines.push(`- [${t.channel}]${t.handle ? ` u/${t.handle}` : ''} "${t.title}" → ${t.url}`);
+  }
+
   type RelayRow = { variant_domain: string; target_domain: string; registered_on: string | null; is_live: boolean; relay_url: string; suggested_message: string };
   const relays = await sql`SELECT variant_domain, target_domain, registered_on, is_live, relay_url, suggested_message FROM relay_leads WHERE status = 'pending' ORDER BY is_live DESC, created_at DESC LIMIT 5` as RelayRow[];
   if (relays.length) {
@@ -3048,7 +3055,7 @@ export async function getVariantPerformance() {
 // People publicly posting "want to buy a domain" — highest free intent there is.
 // Uses the existing Reddit JSON scraper with keywords from the domain analyses.
 
-export async function redditWtbLeads(targetDomains?: string[]): Promise<{ inserted: number; skipped: number; found: number; error?: string }> {
+export async function redditWtbLeads(targetDomains?: string[]): Promise<{ inserted: number; skipped: number; found: number; dmTasks: number; via: string; error?: string }> {
   const portfolio = loadPortfolio(targetDomains);
   const kwSet = new Set<string>();
   for (const asset of portfolio) {
@@ -3065,9 +3072,82 @@ export async function redditWtbLeads(targetDomains?: string[]): Promise<{ insert
         .forEach(w => kwSet.add(w));
     }
   }
-  const { leads, error } = await scrapeRedditJSON(kwSet);
+  // Direct first (free); Reddit blocks all scraper IPs (datacenter AND residential,
+  // verified) — fall back to discovering WTB posts via Google SERP as manual DM tasks.
+  const direct = await scrapeRedditJSON(kwSet);
+  const leads = direct.leads;
+  let dmPosts: { title: string; url: string }[] = [];
+  let via = 'direct';
+  let error = direct.error;
+  if (!leads.length && direct.error?.includes('403') && config.apifyApiKey) {
+    const serp = await discoverRedditWtbViaGoogle();
+    dmPosts = serp.dmPosts;
+    via = 'google-serp';
+    error = serp.error;
+  }
+
+  const targetLabel = portfolio.map(a => a.domain).join(', ');
+  let dmTasks = 0;
+  for (const p of dmPosts) {
+    const rows = await sql`
+      INSERT INTO dm_tasks (channel, url, handle, title, target_domain)
+      VALUES ('reddit', ${p.url}, ${null}, ${p.title}, ${targetLabel})
+      ON CONFLICT (url) DO NOTHING RETURNING id`;
+    if (rows.length) dmTasks++;
+  }
+
   const { inserted, skipped } = await upsertLeads(leads);
-  return { inserted, skipped, found: leads.length, error };
+  return { inserted, skipped, found: leads.length, dmTasks, via, error };
+}
+
+// Reddit WTB discovery via Google SERP (Apify google-search-scraper). Yields
+// post URL + title for a manual DM — posts rarely contain emails anyway.
+async function discoverRedditWtbViaGoogle(): Promise<{ dmPosts: { title: string; url: string }[]; error?: string }> {
+  const since = new Date(Date.now() - 90 * 86400000).toISOString().slice(0, 10);
+  const queries = [
+    `site:reddit.com/r/domainnames (WTB OR buying OR "looking for") after:${since}`,
+    `site:reddit.com/r/Domains (WTB OR "want to buy" OR "looking for") after:${since}`,
+    `site:reddit.com "looking for a domain" after:${since}`,
+  ].join('\n');
+
+  try {
+    const runRes = await axios.post(
+      `https://api.apify.com/v2/acts/apify~google-search-scraper/runs?token=${config.apifyApiKey}`,
+      { queries, resultsPerPage: 20, maxPagesPerQuery: 1, languageCode: 'en', countryCode: 'us' },
+      { timeout: 20000 }
+    );
+    const runId: string = runRes.data?.data?.id;
+    if (!runId) return { dmPosts: [], error: 'Apify SERP run failed to start' };
+
+    for (let i = 0; i < 24; i++) {
+      await sleep(5000);
+      const st = await axios.get(`https://api.apify.com/v2/actor-runs/${runId}?token=${config.apifyApiKey}`);
+      const status: string = st.data?.data?.status;
+      if (status === 'SUCCEEDED' || status === 'FAILED' || status === 'ABORTED') break;
+    }
+
+    const itemsRes = await axios.get(`https://api.apify.com/v2/actor-runs/${runId}/dataset/items?token=${config.apifyApiKey}`);
+    type SerpItem = { organicResults?: { title?: string; url?: string }[] };
+    const items = itemsRes.data as SerpItem[];
+
+    const seen = new Set<string>();
+    const intentRe = /\b(wtb|want(ing)? to buy|looking for|need(ing)?|searching for|help me find|suggest(ions)? for|buy(ing)?)\b/i;
+    const dmPosts: { title: string; url: string }[] = [];
+    for (const item of items) {
+      for (const r of item.organicResults ?? []) {
+        if (!r.url || !/reddit\.com\/r\/[^/]+\/comments\//i.test(r.url) || seen.has(r.url)) continue;
+        const title = (r.title ?? '').replace(/ : r\/\w+.*$/i, '').slice(0, 200);
+        // Only actual purchase intent about domain NAMES — SERPs return plenty of adjacent noise
+        if (!intentRe.test(title) || !/domain|\.com\b|brand name/i.test(title)) continue;
+        if (/co-?founder|job|hire|hiring|career|hosting|email|expert|engineer|developer|course|learn/i.test(title)) continue;
+        seen.add(r.url);
+        dmPosts.push({ title, url: r.url });
+      }
+    }
+    return { dmPosts };
+  } catch (e) {
+    return { dmPosts: [], error: (e as Error).message };
+  }
 }
 
 // ── DAILY INGEST CHAIN ────────────────────────────────────────────────────────

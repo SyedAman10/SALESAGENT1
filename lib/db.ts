@@ -98,6 +98,16 @@ export async function initDb(): Promise<void> {
     estimated_value_usd INTEGER,
     computed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
   )`;
+  await db`CREATE TABLE IF NOT EXISTS dm_tasks (
+    id SERIAL PRIMARY KEY,
+    channel TEXT NOT NULL,
+    url TEXT NOT NULL UNIQUE,
+    handle TEXT,
+    title TEXT,
+    target_domain TEXT,
+    status TEXT NOT NULL DEFAULT 'pending',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  )`;
   await db`CREATE TABLE IF NOT EXISTS relay_leads (
     id SERIAL PRIMARY KEY,
     variant_domain TEXT NOT NULL UNIQUE,
