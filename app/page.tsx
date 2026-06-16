@@ -99,7 +99,7 @@ export default function Dashboard() {
   const [pickerCustomInput, setPickerCustomInput] = useState('');
   const [pickerCustomDomains, setPickerCustomDomains] = useState<string[]>([]);
   const [pendingAction, setPendingAction] = useState<PipelineStep | 'all' | null>(null);
-  const [gmailAccount, setGmailAccount] = useState<string | null>(null);
+  const [gmailAccounts, setGmailAccounts] = useState<{ email: string; is_active: boolean; daily_limit: number; sent_today: number }[]>([]);
   const [warmup, setWarmup] = useState<{
     active: boolean; dayN: number; realLimit: number; warmupCount: number;
     startedAt: string | null; sentToday: number; warmupSentToday: number;
@@ -114,8 +114,8 @@ export default function Dashboard() {
 
   const fetchGmailAccount = useCallback(async () => {
     const res = await fetch('/api/gmail-account');
-    const data = await res.json() as { email: string | null };
-    setGmailAccount(data.email);
+    const data = await res.json() as { accounts: { email: string; is_active: boolean; daily_limit: number; sent_today: number }[] };
+    setGmailAccounts(data.accounts ?? []);
   }, []);
 
   const fetchWarmup = useCallback(async () => {
@@ -448,26 +448,37 @@ export default function Dashboard() {
           </button>
 
           <div className="border-t border-gray-800 pt-3 mt-1">
-            {gmailAccount ? (
-              <div className="mb-2">
-                <div className="flex items-center justify-between px-3 py-2 rounded bg-gray-900 border border-gray-700">
-                  <div>
-                    <p className="text-green-400 text-xs font-medium">Gmail connected</p>
-                    <p className="text-gray-500 text-xs truncate max-w-[140px]">{gmailAccount}</p>
-                  </div>
-                  <button
-                    onClick={async () => { await fetch('/api/gmail-account', { method: 'DELETE' }); setGmailAccount(null); }}
-                    className="text-gray-600 hover:text-red-400 text-xs ml-2"
-                  >disconnect</button>
+            {gmailAccounts.length > 0 && (
+              <div className="mb-2 space-y-1.5">
+                <div className="flex items-center justify-between px-1">
+                  <p className="text-green-400 text-xs font-medium">{gmailAccounts.length} mailbox{gmailAccounts.length !== 1 ? 'es' : ''} connected</p>
+                  <p className="text-gray-600 text-xs">{gmailAccounts.filter(a => a.is_active).reduce((s, a) => s + Math.max(0, a.daily_limit - a.sent_today), 0)} sends left today</p>
                 </div>
+                {gmailAccounts.map(acc => (
+                  <div key={acc.email} className={`flex items-center justify-between px-3 py-2 rounded bg-gray-900 border ${acc.is_active ? 'border-gray-700' : 'border-gray-800 opacity-50'}`}>
+                    <div className="min-w-0">
+                      <p className="text-gray-300 text-xs truncate max-w-[150px]">{acc.email}</p>
+                      <p className="text-gray-600 text-xs">{acc.sent_today}/{acc.daily_limit} sent today</p>
+                    </div>
+                    <div className="flex items-center gap-2 ml-2 shrink-0">
+                      <button
+                        onClick={async () => { await fetch('/api/gmail-account', { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ email: acc.email, is_active: !acc.is_active }) }); fetchGmailAccount(); }}
+                        className={`text-xs ${acc.is_active ? 'text-green-500 hover:text-green-300' : 'text-gray-600 hover:text-gray-400'}`}
+                      >{acc.is_active ? 'on' : 'off'}</button>
+                      <button
+                        onClick={async () => { await fetch(`/api/gmail-account?email=${encodeURIComponent(acc.email)}`, { method: 'DELETE' }); fetchGmailAccount(); }}
+                        className="text-gray-600 hover:text-red-400 text-xs"
+                      >✕</button>
+                    </div>
+                  </div>
+                ))}
               </div>
-            ) : (
-              <a href="/api/auth/google"
-                className="block w-full px-3 py-2.5 rounded border border-gray-600 hover:border-gray-400 text-center text-gray-300 text-xs font-medium transition-colors mb-2">
-                Connect Gmail to send
-              </a>
             )}
-            <button onClick={confirmAndSend} disabled={!!running || sending || (stats?.approved ?? 0) === 0 || !gmailAccount}
+            <a href="/api/auth/google"
+              className="block w-full px-3 py-2.5 rounded border border-gray-600 hover:border-gray-400 text-center text-gray-300 text-xs font-medium transition-colors mb-2">
+              {gmailAccounts.length > 0 ? '+ Connect another mailbox' : 'Connect Gmail to send'}
+            </a>
+            <button onClick={confirmAndSend} disabled={!!running || sending || (stats?.approved ?? 0) === 0 || !gmailAccounts.some(a => a.is_active)}
               className="w-full px-3 py-2.5 rounded bg-green-700 hover:bg-green-600 disabled:opacity-40 text-white text-xs font-medium transition-colors">
               {sending ? 'Sending...' : `Send ${stats?.approved ?? 0} Approved Email${(stats?.approved ?? 0) !== 1 ? 's' : ''}`}
             </button>

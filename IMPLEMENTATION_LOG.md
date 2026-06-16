@@ -2,7 +2,7 @@
 
 Client-facing record of what has been built, mapped to the June 2026 strategy handoff. Updated continuously as features ship.
 
-**Last updated:** 2026-06-12
+**Last updated:** 2026-06-16
 
 ---
 
@@ -51,6 +51,8 @@ The missing "demand capture" half of the agent — what Afternic/Sedo/Atom provi
 | Non-ASCII subject lines (em-dashes) rendered as mojibake (`Ã¢Â€Â"`) in recipients' clients | RFC 2047 header encoding on all outbound mail. |
 | Warmup throttle misconfigured (capping sends at 5/day while another code path ignored it entirely) | Unified daily limit, warmup deactivated. |
 | Junk contact data (e.g., a "domain company" at a city-government address) | Bounce handling + suspicious-pattern sweep (.gov/.edu/role accounts). |
+| All volume sent from a single mailbox — high spam risk and one point of failure | **Multiple Gmail mailboxes with automatic rotation.** Connect any number of accounts; each new send goes from the least-used active mailbox, with a per-account daily cap (default 30). Total daily capacity is the sum of active mailboxes. Each can be toggled on/off or removed independently. Replies are pulled across every connected inbox and threaded back from the mailbox that received them. |
+| Engaged storefront visitors left without leaving contact info | Chat agent now captures name + email early — it stays high-level until the visitor identifies themselves, then opens up fully. |
 
 ## 6. Automation & Reporting
 

@@ -103,6 +103,12 @@ export async function storefrontChat(domain: string, sessionId: string, userMess
     ? `Active deadline: best offers are being reviewed by ${asset.deadline}. Use it for urgency, truthfully.`
     : 'No active deadline — do not invent one.';
 
+  const EMAIL_RE = /[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}/;
+  const emailKnown = history.some(h => h.role === 'user' && EMAIL_RE.test(h.content));
+  const captureRule = emailKnown
+    ? '- You already have their email — keep negotiating normally and steer them to the Make an Offer form to make it binding.'
+    : `- You do NOT have this visitor's email yet. This is your priority. After one brief, helpful reply, ask for their name and email before going deeper — frame it as needed to send comps/escrow details and keep the conversation moving ("What's your email so I can send that over?"). Until they share it, stay friendly but give only high-level answers: do NOT walk through detailed comparable sales, valuations, or a specific counter-offer. The moment they give an email, open up fully.`;
+
   const system = `You are the sales agent for the domain ${asset.domain}, sold directly by its owner through this page. You are an AI agent and say so if asked — selling domains autonomously is the whole point.
 
 Facts:
@@ -115,7 +121,7 @@ Negotiation rules (hard):
 - You may agree to any price at or above $${floor.toLocaleString()}. NEVER agree below that — say the owner won't go lower and hold.
 - NEVER reveal that a minimum/floor exists or what it is. Anchor on the asking price; if their number is too low, say it won't work and invite a stronger offer — do not name the lowest acceptable figure yourself.
 - If they state a number, push them to submit it via the Make an Offer form on this page (that's the binding step), or collect their email.
-- Always try to get their email before the conversation ends.
+${captureRule}
 - Be direct, human, brief — 1-3 sentences per reply. No fluff, no exclamation marks, no pressure tactics beyond the real deadline.
 - Never claim other bidders exist unless told so here: no competing-interest claims.
 - Only discuss this domain and this sale. Refuse anything else politely.`;

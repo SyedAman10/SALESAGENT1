@@ -1,7 +1,7 @@
 import Anthropic from '@anthropic-ai/sdk';
 import axios from 'axios';
 import * as cheerio from 'cheerio';
-import { sendViaGmail, fetchRecentInboundEmails } from './gmail';
+import { sendViaGmail, fetchRecentInboundEmails, getSendCapacityToday } from './gmail';
 import { getEffectiveDailyLimit } from './warmup';
 import fs from 'fs';
 import path from 'path';
@@ -2125,8 +2125,8 @@ export async function syncReplies(sinceDays = 7): Promise<{ scanned: number; mat
     const lead = rows[0];
     if (!lead) continue;
     const ins = await sql`
-      INSERT INTO replies (lead_id, gmail_message_id, gmail_thread_id, rfc_message_id, from_email, subject, snippet, received_at)
-      VALUES (${lead.id}, ${msg.messageId}, ${msg.threadId}, ${msg.rfcMessageId}, ${msg.from}, ${msg.subject}, ${msg.snippet}, ${msg.receivedAt.toISOString()})
+      INSERT INTO replies (lead_id, gmail_message_id, gmail_thread_id, rfc_message_id, from_email, subject, snippet, received_at, gmail_account)
+      VALUES (${lead.id}, ${msg.messageId}, ${msg.threadId}, ${msg.rfcMessageId}, ${msg.from}, ${msg.subject}, ${msg.snippet}, ${msg.receivedAt.toISOString()}, ${msg.account})
       ON CONFLICT (gmail_message_id) DO NOTHING RETURNING id`;
     if (!ins.length) continue;
     matched++;
@@ -2689,7 +2689,7 @@ async function pickVariant(enrichment: LeadEnrichment, variants: { id: number; s
 export async function sendApproved(): Promise<{ sent: number; failed: number }> {
   const sentTodayRows = await sql`SELECT COUNT(*) as c FROM send_log WHERE sent_at::date = CURRENT_DATE`;
   const sentToday = Number((sentTodayRows[0] as { c: string | number }).c ?? 0);
-  const remaining = (await getEffectiveDailyLimit()) - sentToday;
+  const remaining = Math.min((await getEffectiveDailyLimit()) - sentToday, await getSendCapacityToday());
   if (remaining <= 0) return { sent: 0, failed: 0 };
 
   const queue = (await buildSendQueue()).slice(0, remaining);
@@ -2780,20 +2780,22 @@ async function dispatchEmail(email: SendItem, lead: { name: string; email: strin
   // Warm negotiation replies thread into the existing Gmail conversation, no unsubscribe footer
   let threadId: string | undefined;
   let inReplyTo: string | undefined;
+  let fromAccount: string | undefined;
   if (isClosing) {
-    const replyRows = await sql`SELECT gmail_thread_id, rfc_message_id FROM replies WHERE lead_id = ${email.lead_id} ORDER BY received_at DESC LIMIT 1` as { gmail_thread_id: string | null; rfc_message_id: string | null }[];
+    const replyRows = await sql`SELECT gmail_thread_id, rfc_message_id, gmail_account FROM replies WHERE lead_id = ${email.lead_id} ORDER BY received_at DESC LIMIT 1` as { gmail_thread_id: string | null; rfc_message_id: string | null; gmail_account: string | null }[];
     threadId = replyRows[0]?.gmail_thread_id ?? undefined;
     inReplyTo = replyRows[0]?.rfc_message_id ?? undefined;
+    fromAccount = replyRows[0]?.gmail_account ?? undefined;
   }
   const body = isClosing
     ? email.body
     : `${email.body}\n\n---\nTo unsubscribe: ${config.baseUrl}/api/unsubscribe?email=${encodeURIComponent(lead.email)}`;
 
-  await sendViaGmail({ to: lead.email, subject: email.subject, body, threadId, inReplyTo });
+  const { from } = await sendViaGmail({ to: lead.email, subject: email.subject, body, threadId, inReplyTo, from: fromAccount });
   await sql`UPDATE emails SET status = 'sent', sent_at = NOW() WHERE id = ${email.id}`;
   // warmfirst recipients are already 'replied' — don't downgrade them to 'contacted'
   if (email.sequence_day === 1 && !isClosing && email.variant !== 'warmfirst') await sql`UPDATE leads SET status = 'contacted' WHERE id = ${email.lead_id}`;
-  await sql`INSERT INTO send_log (email_id, result) VALUES (${email.id}, 'ok')`;
+  await sql`INSERT INTO send_log (email_id, result, gmail_account) VALUES (${email.id}, 'ok', ${from})`;
 }
 
 // ── SEND (streaming) ──────────────────────────────────────────────────────────
@@ -2804,16 +2806,17 @@ export async function sendApprovedStream(emit: Emitter): Promise<void> {
   const sentTodayRows = await sql`SELECT COUNT(*) as c FROM send_log WHERE sent_at::date = CURRENT_DATE`;
   const sentToday = Number((sentTodayRows[0] as { c: string | number }).c ?? 0);
   const dailyLimit = await getEffectiveDailyLimit();
-  const remaining = dailyLimit - sentToday;
+  const capacity = await getSendCapacityToday();
+  const remaining = Math.min(dailyLimit - sentToday, capacity);
 
   if (remaining <= 0) {
-    emit({ type: 'log', message: `Daily limit of ${dailyLimit} already reached.` });
+    emit({ type: 'log', message: capacity <= 0 ? 'All connected mailboxes have hit their daily cap.' : `Daily limit of ${dailyLimit} already reached.` });
     return;
   }
 
   const queue = (await buildSendQueue()).slice(0, remaining);
 
-  emit({ type: 'log', message: `Sending ${queue.length} emails (limit: ${dailyLimit} — ${remaining} remaining today)` });
+  emit({ type: 'log', message: `Sending ${queue.length} emails across mailboxes (limit: ${dailyLimit}, mailbox capacity: ${capacity} — ${remaining} to send)` });
 
   let sent = 0; let failed = 0;
 

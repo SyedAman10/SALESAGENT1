@@ -219,4 +219,11 @@ export async function initDb(): Promise<void> {
     sent_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     subject TEXT NOT NULL
   )`;
+
+  // Multi-mailbox rotation: track which Gmail account sent each email and
+  // give each account its own active flag + per-day send cap for deliverability.
+  await db`ALTER TABLE send_log ADD COLUMN IF NOT EXISTS gmail_account TEXT`;
+  await db`ALTER TABLE replies ADD COLUMN IF NOT EXISTS gmail_account TEXT`;
+  await db`ALTER TABLE gmail_accounts ADD COLUMN IF NOT EXISTS is_active BOOLEAN NOT NULL DEFAULT true`;
+  await db`ALTER TABLE gmail_accounts ADD COLUMN IF NOT EXISTS daily_limit INTEGER NOT NULL DEFAULT 30`;
 }
