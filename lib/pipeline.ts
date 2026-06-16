@@ -3170,7 +3170,10 @@ export async function runDailyIngestChain(budgetMs = 270000): Promise<Record<str
   out.ignored = await markIgnoredOutcomes().catch(e => ({ error: (e as Error).message }));
   out.comps = await scrapeCompSales().catch(e => ({ error: (e as Error).message }));
   out.warmfirst = await writeWarmFirstEmails(targets).catch(e => ({ error: (e as Error).message }));
-  out.ingest = await testNewSources(targets);
+  // testNewSources (job-title spray) disabled: for brandable .coms it matches anyone
+  // with a vaguely-related title (e.g. every Pilates studio owner) — demographic, not
+  // intent. Use the intent-based sources below (funding/rebrand triggers, upgrade,
+  // name-match, Reddit WTB) which target buyers in an actual naming moment.
   if (left() > 90000) out.upgrade = await findUpgradeBuyers(targets);
   if (left() > 90000) out.namematch = await findCompanyNameMatches(targets);
   if (left() > 90000) out.triggers = await findTriggerLeads(targets).catch(e => ({ error: (e as Error).message }));
