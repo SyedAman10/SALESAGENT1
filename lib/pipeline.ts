@@ -1768,59 +1768,60 @@ async function getDomainAnalysis(domain: string): Promise<DomainAnalysis | null>
 
 export async function analyzeDomains(targetDomains?: string[]): Promise<{ analyzed: number; skipped: number }> {
   const portfolio = loadPortfolio(targetDomains);
-  let analyzed = 0; let skipped = 0;
+  const existing = new Set((await sql`SELECT domain FROM domain_analyses` as { domain: string }[]).map(r => r.domain));
+  const todo = portfolio.filter(a => !existing.has(a.domain));
+  let analyzed = 0;
 
-  for (const asset of portfolio) {
-    const existing = await sql`SELECT id FROM domain_analyses WHERE domain = ${asset.domain}`;
-    if (existing.length) { skipped++; continue; }
-
-    const realComps = await getRelevantComps(asset.domain, asset.asking_price).catch(() => [] as string[]);
+  // Batched + cheap-model analysis: one call covers many domains on Haiku, cutting
+  // token cost ~10x vs one Sonnet call per domain. Resumable — only un-analyzed
+  // domains are queued, so a failed batch is simply retried on the next run.
+  const BATCH = 10;
+  for (let i = 0; i < todo.length; i += BATCH) {
+    const batch = todo.slice(i, i + BATCH);
     try {
       const res = await client.messages.create({
-        model: config.model,
-        max_tokens: 800,
-        messages: [{ role: 'user', content: domainAnalysisPrompt(asset, realComps) }],
+        model: config.analyzeModel,
+        max_tokens: 4096,
+        messages: [{ role: 'user', content: batchAnalysisPrompt(batch) }],
       });
-
-      const text = res.content[0].type === 'text' ? res.content[0].text : '';
-      const result = JSON.parse(text.replace(/```json\n?|\n?```/g, '').trim()) as DomainAnalysis;
-      await sql`INSERT INTO domain_analyses (domain, analysis) VALUES (${asset.domain}, ${JSON.stringify(result)}) ON CONFLICT (domain) DO UPDATE SET analysis = EXCLUDED.analysis`;
-      analyzed++;
-    } catch { skipped++; }
-
-    await sleep(300);
+      const text = res.content[0].type === 'text' ? res.content[0].text : '[]';
+      const rows = JSON.parse(text.replace(/```json\n?|\n?```/g, '').trim()) as (DomainAnalysis & { domain: string })[];
+      for (const row of rows) {
+        const asset = batch.find(b => b.domain.toLowerCase() === String(row.domain ?? '').toLowerCase());
+        if (!asset) continue;
+        const { domain: _omit, ...analysis } = row;
+        await sql`INSERT INTO domain_analyses (domain, analysis) VALUES (${asset.domain}, ${JSON.stringify(analysis)}) ON CONFLICT (domain) DO UPDATE SET analysis = EXCLUDED.analysis`;
+        analyzed++;
+      }
+    } catch { /* batch failed — domains stay un-analyzed and are retried next run */ }
+    await sleep(500);
   }
 
-  return { analyzed, skipped };
+  return { analyzed, skipped: portfolio.length - todo.length };
 }
 
-function domainAnalysisPrompt(asset: Asset, realComps: string[] = []): string {
-  return `You are a domain name expert and sales strategist. Deeply analyse this domain and generate actionable sales intelligence.
+function batchAnalysisPrompt(assets: Asset[]): string {
+  const list = assets.map((a, i) => `${i + 1}. ${a.domain} — category: ${a.category}, asking: $${a.asking_price.toLocaleString()}${a.description ? `, note: ${a.description}` : ''}`).join('\n');
+  return `You are a domain name expert and sales strategist. Analyse EACH domain below and generate sales intelligence for all of them.
 
-Domain: ${asset.domain}
-Category: ${asset.category}
-Asking price: $${asset.asking_price.toLocaleString()}
-Description: ${asset.description}${realComps.length ? `\nVerified recent aftermarket sales (use these as comparable_sales — they are real): ${realComps.join('; ')}` : ''}
+Domains:
+${list}
 
-Think about:
-- What the name sounds like, its linguistic feel, cultural associations
-- What industries or niches it would appeal to
-- Who would buy this domain (end user vs domain investor for resale)
-- What comparable domains have sold for (use your knowledge of the domain aftermarket)
-- What makes it valuable and what the compelling pitch is
+For every domain, target the END-USER who would build a brand on it (not domain investors). Use your knowledge of the domain aftermarket for comparable_sales.
 
-Return JSON only:
-{
-  "ideal_buyer_types": ["e.g. domain broker for resale", "startup founder in wellness", "membership platform"],
-  "industries": ["list of industries this domain fits"],
-  "use_cases": ["specific use case 1", "specific use case 2"],
-  "value_props": ["why this domain is valuable — brand recall, SEO, niche fit, etc."],
-  "comparable_sales": ["e.g. socialclub.com $8k", "fitclub.com $5.5k — use real knowledge where possible"],
-  "email_hooks": ["specific angle 1 to open a cold email with", "specific angle 2"],
-  "buyer_profile_summary": "2-3 sentences describing the ideal buyer and why they'd want this",
-  "one_liner": "one punchy sentence summarising the domain's value proposition"
-}
-Return valid JSON only.`;
+Return ONLY a JSON array — one object per domain, in the same order:
+[{
+  "domain": "exact domain from the list",
+  "ideal_buyer_types": ["who would buy and build on this"],
+  "industries": ["industries it fits"],
+  "use_cases": ["specific use case 1", "use case 2"],
+  "value_props": ["why it's valuable — brand recall, SEO, niche fit"],
+  "comparable_sales": ["e.g. cbdoil.com $25k — real where possible"],
+  "email_hooks": ["cold-email opening angle 1", "angle 2"],
+  "buyer_profile_summary": "2-3 sentences on the ideal buyer and why they'd want it",
+  "one_liner": "one punchy value sentence"
+}]
+Return valid JSON only — no prose, no markdown.`;
 }
 
 // ── MATCH ─────────────────────────────────────────────────────────────────────

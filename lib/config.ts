@@ -14,5 +14,7 @@ export const config = {
   dailySendLimit: parseInt(process.env.DAILY_SEND_LIMIT ?? '50'),
   leadScoreThreshold: parseInt(process.env.LEAD_SCORE_THRESHOLD ?? '60'),
   model: 'claude-sonnet-4-6' as const,
+  // Cheap model for bulk/low-judgment work (domain analysis) — overridable via env
+  analyzeModel: process.env.ANALYZE_MODEL ?? 'claude-haiku-4-5',
   baseUrl: process.env.NEXT_PUBLIC_BASE_URL ?? 'http://localhost:3000',
 };
