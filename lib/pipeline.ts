@@ -646,6 +646,7 @@ interface ApolloPersonResult {
   email?: string;
   has_email?: boolean;
   linkedin_url?: string;
+  title?: string;
   organization?: { name?: string; primary_domain?: string };
   [key: string]: unknown;
 }
@@ -2332,11 +2333,18 @@ export async function findTriggerLeads(targetDomains?: string[]): Promise<{ inse
   const errors: Record<string, string> = {};
   const companies: { name: string; trigger: string; domain: string }[] = [];
 
+  // Generic industries ("health and wellness", "technology") pull funding news for
+  // any startup — the relevance gate. Use only the domain's specific niches so a
+  // CBD domain matches cannabis/CBD companies, not every wellness app.
+  const GENERIC_INDUSTRY_RE = /^(health( and| &)? wellness|wellness|health( ?care)?|technology|tech|e-?commerce|retail|business|consumer goods|saas|software|marketing|services|general|startups?|lifestyle|digital|online)$/i;
+
   for (const asset of portfolio) {
     const analysis = await getDomainAnalysis(asset.domain);
     if (!analysis) { errors[asset.domain] = 'no analysis'; continue; }
 
-    for (const industry of analysis.industries.slice(0, 3)) {
+    const niches = analysis.industries.filter(i => !GENERIC_INDUSTRY_RE.test(i.trim()));
+    const useIndustries = (niches.length ? niches : analysis.industries).slice(0, 3);
+    for (const industry of useIndustries) {
       const query = `"${industry}" startup ("raises" OR "series a" OR "seed round" OR "rebrand")`;
       try {
         const res = await axios.get(`https://news.google.com/rss/search?q=${encodeURIComponent(query)}&hl=en-US&gl=US&ceid=US:en`, {
@@ -2365,6 +2373,10 @@ Max 8. Return [] if none.` }],
     }
   }
 
+  // Only people who can actually authorize buying a domain — Apollo's seniority
+  // filter leaks ICs (engineers, editors, IT), so gate on the title text itself.
+  const DECISION_MAKER_RE = /\b(founder|co-?founder|ceo|chief executive|cmo|chief marketing|chief brand|cbo|owner|president|managing director|\bmd\b|partner|head of (brand|marketing|growth|digital|ecommerce)|vp,? (of )?(brand|marketing|growth|ecommerce)|(brand|marketing|growth) director)\b/i;
+
   // Contact discovery via Apollo (requires working Apollo API access)
   const allLeads: RawLead[] = [];
   const seen = new Set<string>();
@@ -2372,11 +2384,13 @@ Max 8. Return [] if none.` }],
     try {
       const res = await axios.post(
         'https://api.apollo.io/api/v1/mixed_people/api_search',
-        { q_organization_name: c.name, person_seniority: ['owner', 'founder', 'c_suite', 'vp'], per_page: 5, page: 1 },
+        { q_organization_name: c.name, person_seniority: ['owner', 'founder', 'c_suite'], per_page: 5, page: 1 },
         { headers: { 'Content-Type': 'application/json', 'X-Api-Key': config.apolloApiKey } }
       );
       const people: ApolloPersonResult[] = res.data?.people ?? [];
-      const relevant = people.filter(p => p.organization?.name?.toLowerCase().includes(c.name.toLowerCase().split(' ')[0]));
+      const relevant = people.filter(p =>
+        p.organization?.name?.toLowerCase().includes(c.name.toLowerCase().split(' ')[0]) &&
+        DECISION_MAKER_RE.test(p.title ?? ''));
       const toReveal = relevant.filter(p => p.has_email && !p.email).slice(0, 3);
       const revealed = toReveal.length ? await revealEmails(toReveal) : [];
       for (const p of [...relevant.filter(p => p.email?.includes('@')), ...revealed].filter(p => p.email)) {
