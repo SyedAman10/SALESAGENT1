@@ -62,6 +62,24 @@ interface BrokerPitch {
   body: string;
 }
 
+interface RelayLead {
+  variant_domain: string;
+  target_domain: string;
+  registrar: string | null;
+  registered_on: string | null;
+  is_live: boolean;
+  relay_url: string;
+  suggested_message: string;
+}
+
+interface DmTask {
+  channel: string;
+  url: string;
+  handle: string | null;
+  title: string | null;
+  target_domain: string | null;
+}
+
 const STEPS: { key: PipelineStep; label: string; desc: string }[] = [
   { key: 'analyze', label: '0. Analyze', desc: 'Study domain portfolio' },
   { key: 'ingest', label: '1. Ingest', desc: 'Domain-specific + broker leads' },
@@ -86,7 +104,7 @@ export default function Dashboard() {
   const [stats, setStats] = useState<Stats | null>(null);
   const [leads, setLeads] = useState<Lead[]>([]);
   const [emails, setEmails] = useState<Email[]>([]);
-  const [activeTab, setActiveTab] = useState<'overview' | 'leads' | 'emails' | 'sent' | 'analysis' | 'broker'>('overview');
+  const [activeTab, setActiveTab] = useState<'overview' | 'leads' | 'emails' | 'sent' | 'analysis' | 'broker' | 'outreach'>('overview');
   const [running, setRunning] = useState<string | null>(null);
   const [log, setLog] = useState<string[]>([]);
   const [selectedEmail, setSelectedEmail] = useState<Email | null>(null);
@@ -111,6 +129,12 @@ export default function Dashboard() {
   const [brokerPitches, setBrokerPitches] = useState<BrokerPitch[]>([]);
   const [brokerLoading, setBrokerLoading] = useState(false);
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
+  const [manualTasks, setManualTasks] = useState<{ relays: RelayLead[]; dmTasks: DmTask[] }>({ relays: [], dmTasks: [] });
+
+  const fetchManualTasks = useCallback(async () => {
+    const res = await fetch('/api/manual-tasks');
+    setManualTasks(await res.json());
+  }, []);
 
   const fetchGmailAccount = useCallback(async () => {
     const res = await fetch('/api/gmail-account');
@@ -157,7 +181,8 @@ export default function Dashboard() {
     fetchPortfolio();
     fetchGmailAccount();
     fetchWarmup();
-  }, [fetchStats, fetchLeads, fetchEmails, fetchSentEmails, fetchPortfolio, fetchGmailAccount, fetchWarmup]);
+    fetchManualTasks();
+  }, [fetchStats, fetchLeads, fetchEmails, fetchSentEmails, fetchPortfolio, fetchGmailAccount, fetchWarmup, fetchManualTasks]);
 
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
@@ -315,10 +340,10 @@ export default function Dashboard() {
           <p className="text-gray-500 text-xs mt-0.5">indikaclub.com · $3,900</p>
         </div>
         <div className="flex gap-2">
-          {(['overview', 'leads', 'emails', 'sent', 'analysis', 'broker'] as const).map(tab => (
-            <button key={tab} onClick={() => { setActiveTab(tab); if (tab === 'sent') fetchSentEmails(); if (tab === 'analysis') fetchPortfolio(); }}
+          {(['overview', 'leads', 'emails', 'sent', 'analysis', 'broker', 'outreach'] as const).map(tab => (
+            <button key={tab} onClick={() => { setActiveTab(tab); if (tab === 'sent') fetchSentEmails(); if (tab === 'analysis') fetchPortfolio(); if (tab === 'outreach') fetchManualTasks(); }}
               className={`px-3 py-1.5 rounded text-xs capitalize ${activeTab === tab ? 'bg-gray-700 text-white' : 'text-gray-400 hover:text-white'}`}>
-              {tab === 'overview' ? 'Overview' : tab === 'leads' ? `Leads (${total})` : tab === 'emails' ? `Approved (${emails.length})` : tab === 'sent' ? `Sent (${sentEmails.length})` : tab === 'broker' ? `Brokers (${brokerPitches.length})` : `Domains (${portfolio.length})`}
+              {tab === 'overview' ? 'Overview' : tab === 'leads' ? `Leads (${total})` : tab === 'emails' ? `Approved (${emails.length})` : tab === 'sent' ? `Sent (${sentEmails.length})` : tab === 'broker' ? `Brokers (${brokerPitches.length})` : tab === 'outreach' ? `Outreach (${manualTasks.relays.length + manualTasks.dmTasks.length})` : `Domains (${portfolio.length})`}
             </button>
           ))}
         </div>
@@ -896,6 +921,68 @@ export default function Dashboard() {
                       </div>
                     );
                   })}
+                </div>
+              )}
+            </div>
+          )}
+
+          {activeTab === 'outreach' && (
+            <div className="space-y-6">
+              {manualTasks.relays.length === 0 && manualTasks.dmTasks.length === 0 && (
+                <div className="text-center py-12">
+                  <p className="text-gray-500 text-xs">No pending manual outreach.</p>
+                  <p className="text-gray-600 text-xs mt-1">Relay leads (owners of a worse-TLD variant of your domains) and Reddit/HN DM tasks show up here when sourcing finds them.</p>
+                </div>
+              )}
+
+              {manualTasks.relays.length > 0 && (
+                <div>
+                  <p className="text-gray-500 text-xs uppercase tracking-wider mb-3">Registrant relay leads ({manualTasks.relays.length}) — owner of a worse-TLD variant; ~60s each</p>
+                  <div className="space-y-3">
+                    {manualTasks.relays.map(r => {
+                      const key = `relay-${r.variant_domain}`;
+                      return (
+                        <div key={key} className="bg-gray-900 border border-gray-800 rounded-lg p-4 space-y-3">
+                          <div className="flex items-start justify-between gap-2">
+                            <div>
+                              <p className="text-white text-xs font-semibold">{r.variant_domain}{r.is_live && <span className="ml-2 text-green-400">● live</span>}</p>
+                              <p className="text-gray-500 text-xs">prospect for <span className="text-gray-300">{r.target_domain}</span>{r.registered_on ? ` · held since ${new Date(r.registered_on).getFullYear()}` : ''}</p>
+                            </div>
+                            <div className="flex gap-2 flex-shrink-0">
+                              <button onClick={() => { void navigator.clipboard.writeText(r.suggested_message); setCopiedKey(key); setTimeout(() => setCopiedKey(null), 2000); }}
+                                className={`px-2.5 py-1 rounded text-xs font-medium transition-colors ${copiedKey === key ? 'bg-green-700 text-green-100' : 'bg-gray-700 hover:bg-gray-600 text-gray-300'}`}>
+                                {copiedKey === key ? 'Copied!' : 'Copy message'}
+                              </button>
+                              <a href={r.relay_url} target="_blank" rel="noopener noreferrer"
+                                className="px-2.5 py-1 rounded text-xs font-medium bg-blue-700 hover:bg-blue-600 text-white">Open form ↗</a>
+                              <button onClick={async () => { await fetch(`/api/task/done?relay=${encodeURIComponent(r.variant_domain)}`); fetchManualTasks(); }}
+                                className="px-2.5 py-1 rounded text-xs font-medium bg-gray-800 hover:bg-green-800 text-gray-400 hover:text-green-200">✓ Sent</button>
+                            </div>
+                          </div>
+                          <pre className="text-gray-300 text-xs whitespace-pre-wrap leading-relaxed border-t border-gray-800 pt-2">{r.suggested_message}</pre>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              )}
+
+              {manualTasks.dmTasks.length > 0 && (
+                <div>
+                  <p className="text-gray-500 text-xs uppercase tracking-wider mb-3">DM tasks ({manualTasks.dmTasks.length}) — Reddit/HN posts to reply to</p>
+                  <div className="space-y-2">
+                    {manualTasks.dmTasks.map(t => (
+                      <div key={t.url} className="bg-gray-900 border border-gray-800 rounded-lg p-3 flex items-start justify-between gap-3">
+                        <div className="min-w-0">
+                          <p className="text-gray-200 text-xs">[{t.channel}]{t.handle ? ` u/${t.handle}` : ''} {t.title}</p>
+                          <a href={t.url} target="_blank" rel="noopener noreferrer" className="text-blue-500 hover:text-blue-400 text-xs break-all">{t.url} ↗</a>
+                          {t.target_domain && <span className="text-gray-600 text-xs ml-2">→ {t.target_domain}</span>}
+                        </div>
+                        <button onClick={async () => { await fetch(`/api/task/done?dm=${encodeURIComponent(t.url)}`); fetchManualTasks(); }}
+                          className="flex-shrink-0 px-2.5 py-1 rounded text-xs font-medium bg-gray-800 hover:bg-green-800 text-gray-400 hover:text-green-200">✓ Done</button>
+                      </div>
+                    ))}
+                  </div>
                 </div>
               )}
             </div>
