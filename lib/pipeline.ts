@@ -3310,6 +3310,70 @@ export async function hackerNewsWtbLeads(targetDomains?: string[]): Promise<{ fo
   return { found: hits.size, dmTasks, matched };
 }
 
+// ── X / TWITTER WTB ───────────────────────────────────────────────────────────
+// Founders/brands occasionally post naming or domain intent on X. Direct search via
+// Apify (kaito pay-per-result scraper — no X auth needed). Matched against the
+// portfolio's niche and surfaced as manual DM tasks, same as Reddit/HN.
+type XTweet = { url?: string; twitterUrl?: string; text?: string; createdAt?: string; author?: { userName?: string } };
+
+export async function xWtbLeads(targetDomains?: string[]): Promise<{ found: number; dmTasks: number; matched: number; error?: string }> {
+  if (!config.apifyApiKey) return { found: 0, dmTasks: 0, matched: 0, error: 'no apify key' };
+  const portfolio = loadPortfolio(targetDomains);
+  const generic = new Set(['domain', 'domains', 'name', 'names', 'brand', 'brands', 'website', 'online', 'business', 'company', 'premium', 'digital', 'startup', 'startups', 'product']);
+  const domainKws: { domain: string; kws: string[] }[] = [];
+  for (const asset of portfolio) {
+    const base = asset.domain.split('.')[0].toLowerCase();
+    const kw = new Set<string>([base]);
+    const suffix = base.match(/(club|app|hub|lab|shop|store)$/i)?.[1];
+    if (suffix) { kw.add(suffix); kw.add(base.slice(0, -suffix.length)); }
+    const analysis = await getDomainAnalysis(asset.domain);
+    if (analysis) {
+      [...analysis.industries, ...analysis.use_cases]
+        .flatMap(s => s.toLowerCase().split(/[\s,/&]+/))
+        .filter(w => w.length > 3).slice(0, 20).forEach(w => kw.add(w));
+    }
+    domainKws.push({ domain: asset.domain, kws: [...kw].filter(w => w.length > 3 && !generic.has(w)) });
+  }
+
+  // Niche-scoped search terms with a since: operator so X only returns recent tweets
+  // (raw search otherwise dredges up years-old posts). Intent + relevance gates below.
+  const since = new Date(Date.now() - 120 * 86400000).toISOString().slice(0, 10);
+  const queries = ['cbd brand name', 'cannabis brand name', 'naming my cbd', 'looking for a cannabis domain', 'need a name for my cbd']
+    .map(q => `${q} since:${since}`);
+  let tweets: XTweet[] = [];
+  try {
+    const res = await axios.post(
+      `https://api.apify.com/v2/acts/kaitoeasyapi~twitter-x-data-tweet-scraper-pay-per-result-cheapest/run-sync-get-dataset-items?token=${config.apifyApiKey}`,
+      { searchTerms: queries, maxItems: 60, sort: 'Latest', tweetLanguage: 'en' },
+      { timeout: 120000 }
+    );
+    tweets = (res.data as XTweet[]).filter(t => t && t.text);
+  } catch (e) { return { found: 0, dmTasks: 0, matched: 0, error: (e as Error).message }; }
+
+  // First-person seeking only — bare "rebranding" matched news headlines and jokes.
+  const intentRe = /\b(looking for a (domain|name)|need a (domain|name) for (my|our)|what (should i|to) (call|name)|name for (my|our) (brand|company|dispensary|shop|line|startup|cbd|cannabis)|help me name (my|our)|suggest(ions)? for a (name|domain)|naming (my|our) (brand|company|dispensary|shop|line|startup))\b/i;
+  const cutoff = Date.now() - 130 * 86400000;
+  const seen = new Set<string>();
+  let matched = 0; let dmTasks = 0;
+  for (const tw of tweets) {
+    const text = (tw.text ?? '').replace(/\s+/g, ' ');
+    const url = tw.url ?? tw.twitterUrl;
+    if (!url || seen.has(url) || /^rt @/i.test(text) || !intentRe.test(text)) continue;
+    const ts = tw.createdAt ? Date.parse(tw.createdAt) : NaN;
+    if (!Number.isNaN(ts) && ts < cutoff) continue; // recency backstop
+    const lc = text.toLowerCase();
+    const fit = domainKws.filter(d => d.kws.some(kw => lc.includes(kw))).map(d => d.domain);
+    if (!fit.length) continue;
+    seen.add(url); matched++;
+    const rows = await sql`
+      INSERT INTO dm_tasks (channel, url, handle, title, target_domain)
+      VALUES ('x', ${url}, ${tw.author?.userName ?? null}, ${text.slice(0, 200)}, ${fit.join(', ')})
+      ON CONFLICT (url) DO NOTHING RETURNING id`;
+    if (rows.length) dmTasks++;
+  }
+  return { found: tweets.length, dmTasks, matched };
+}
+
 // ── DAILY INGEST CHAIN ────────────────────────────────────────────────────────
 // Time-budgeted front-of-funnel run for cron: find fresh buyers for closing-mode
 // domains, then enrich → match → write → decide. Every step is resumable, so
@@ -3336,6 +3400,7 @@ export async function runDailyIngestChain(budgetMs = 270000): Promise<Record<str
   if (left() > 90000) out.triggers = await findTriggerLeads(targets).catch(e => ({ error: (e as Error).message }));
   if (left() > 90000) out.reddit = await redditWtbLeads(targets).catch(e => ({ error: (e as Error).message }));
   if (left() > 60000) out.hn = await hackerNewsWtbLeads(targets).catch(e => ({ error: (e as Error).message }));
+  if (left() > 60000) out.x = await xWtbLeads(targets).catch(e => ({ error: (e as Error).message }));
   // End-user business scraping (Google Maps → public contact emails) — only with
   // ample headroom; the Apify Maps run is slow. Time-boxed internally.
   if (left() > 150000) out.business = await testApifyApollo(targets, left() - 90000).catch(e => ({ error: (e as Error).message }));
