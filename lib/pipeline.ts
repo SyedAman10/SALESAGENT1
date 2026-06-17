@@ -1408,6 +1408,9 @@ async function extractBusinessEmail(websiteUrl: string): Promise<string | null> 
 // gives broad market coverage (capped at 12 Maps searches in getGoogleMapsBusinesses).
 const MAPS_LOCATIONS = ['California', 'Colorado', 'Michigan', 'Oregon', 'Massachusetts', 'Illinois'];
 
+// Directory/platform emails (the listing's fallback, not the actual business)
+const PLATFORM_EMAIL_RE = /@(weedmaps|leafly|dutchie|iheartjane|jane|getsauce|tymber)\.(com|co|io)$/i;
+
 // Pure Apify workflow: Google Maps → contact page scraping → real end-user business
 // emails (no Apollo). Niche queries are deduped across the whole portfolio, so a
 // 55-domain CBD portfolio runs ONE Maps search of the shared niche instead of 55.
@@ -1452,7 +1455,7 @@ export async function testApifyApollo(targetDomains?: string[], budgetMs = 12000
     if (Date.now() - phase2Start > budgetMs) break;
     const email = (biz.emails ?? [])
       .map(e => e?.toLowerCase().trim())
-      .find(e => !!e && e.includes('@') && !/^(noreply|no-reply|donotreply)/.test(e));
+      .find(e => !!e && e.includes('@') && !/^(noreply|no-reply|donotreply)/.test(e) && !PLATFORM_EMAIL_RE.test(e));
 
     if (email && !seen.has(email)) {
       seen.add(email);
@@ -1481,6 +1484,52 @@ export async function testApifyApollo(targetDomains?: string[], budgetMs = 12000
   const sources: Record<string, number> = {};
   for (const l of allLeads) { const src = l.source ?? 'unknown'; sources[src] = (sources[src] ?? 0) + 1; }
   return { inserted, skipped, sources, breakdown, errors };
+}
+
+// ── WEEDMAPS DISPENSARIES ─────────────────────────────────────────────────────
+// Weedmaps is the canonical cannabis directory: every licensed dispensary, with a
+// contact email/phone in the listing. Far higher email yield than Google Maps for
+// this niche. Emails → leads; phone-only → manual call tasks. Markets rotate per run.
+type WeedmapsDispensary = { id?: string; slug?: string; name?: string; email?: string; phone_number?: string; web_url?: string; address?: string; city?: string; state?: string; zip_code?: string; license_type?: string };
+
+export async function weedmapsLeads(maxPerLocation = 25): Promise<{ leads: number; callTasks: number; found: number; error?: string }> {
+  if (!config.apifyApiKey) return { leads: 0, callTasks: 0, found: 0, error: 'no apify key' };
+  const locs = [...MAPS_LOCATIONS].sort(() => Math.random() - 0.5).slice(0, 4);
+
+  let dispensaries: WeedmapsDispensary[] = [];
+  try {
+    const r = await axios.post(
+      `https://api.apify.com/v2/acts/krazee_kaushik~weedmaps-dispensary-scraper/run-sync-get-dataset-items?token=${config.apifyApiKey}`,
+      { searchLocations: locs, dispensariesPerSearch: maxPerLocation },
+      { timeout: 280000 }
+    );
+    dispensaries = r.data as WeedmapsDispensary[];
+  } catch (e) { return { leads: 0, callTasks: 0, found: 0, error: (e as Error).message }; }
+
+  const allLeads: RawLead[] = [];
+  const seen = new Set<string>();
+  let callTasks = 0;
+  for (const d of dispensaries) {
+    const email = (d.email ?? '').toLowerCase().trim();
+    const addr = [d.address, d.city, d.state, d.zip_code].filter(Boolean).join(', ');
+    const raw = { website: d.web_url, address: addr, phone: d.phone_number, license_type: d.license_type, source: 'weedmaps' };
+    if (email && email.includes('@') && !/^(noreply|no-reply|donotreply)/.test(email) && !PLATFORM_EMAIL_RE.test(email) && !seen.has(email)) {
+      seen.add(email);
+      allLeads.push({ name: d.name ?? email.split('@')[0], email, company: d.name, source: 'weedmaps', raw_data: raw });
+    } else if (!email && (d.phone_number || d.web_url) && callTasks < 80) {
+      const key = d.web_url || `weedmaps:${d.id ?? d.slug ?? d.name}`;
+      if (key && !seen.has(key)) {
+        seen.add(key);
+        const ins = await sql`
+          INSERT INTO dm_tasks (channel, url, handle, title, target_domain)
+          VALUES ('call', ${key}, ${d.phone_number ?? null}, ${`${d.name ?? 'Dispensary'}${addr ? ' — ' + addr : ''}`.slice(0, 200)}, ${null})
+          ON CONFLICT (url) DO NOTHING RETURNING id`;
+        if (ins.length) callTasks++;
+      }
+    }
+  }
+  const { inserted } = await upsertLeads(allLeads);
+  return { leads: inserted, callTasks, found: dispensaries.length };
 }
 
 // ── UPGRADE BUYER FINDER ─────────────────────────────────────────────────────
