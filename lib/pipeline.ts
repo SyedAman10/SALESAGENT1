@@ -1484,11 +1484,25 @@ export async function getRelayLeads(status = 'pending') {
   return await sql`SELECT * FROM relay_leads WHERE status = ${status} ORDER BY is_live DESC, created_at DESC`;
 }
 
-export async function findUpgradeBuyers(targetDomains?: string[]): Promise<{
+// TLDs a business settles for when the clean .com is taken — the wider the net,
+// the more same-name variant owners we find (each a natural buyer of the .com).
+const UPGRADE_TLDS = [
+  'net', 'co', 'org', 'club', 'io', 'app', 'us', 'biz', 'info',
+  'shop', 'store', 'online', 'site', 'xyz', 'life', 'pro', 'ca', 'co.uk', 'com.au',
+];
+
+export async function findUpgradeBuyers(targetDomains?: string[], budgetMs = 60000): Promise<{
   inserted: number; skipped: number; liveVariants: string[];
   breakdown: Record<string, number>; errors: Record<string, string>;
 }> {
-  const portfolio = loadPortfolio(targetDomains);
+  // ~25 variant checks/domain is slow (live + RDAP lookups); time-box so the daily
+  // cron never overruns, and shuffle so coverage rotates across the portfolio over
+  // successive runs instead of always starting from the same domains.
+  const start = Date.now();
+  const portfolio = loadPortfolio(targetDomains)
+    .map(a => ({ a, r: Math.random() }))
+    .sort((x, y) => x.r - y.r)
+    .map(x => x.a);
   const allLeads: RawLead[] = [];
   const seen = new Set<string>();
   const liveVariants: string[] = [];
@@ -1496,13 +1510,13 @@ export async function findUpgradeBuyers(targetDomains?: string[]): Promise<{
   const errors: Record<string, string> = {};
 
   for (const asset of portfolio) {
+    if (Date.now() - start > budgetMs) break; // resume remaining domains next run
     const baseName = asset.domain.replace(/\.(com|net|org|io|co|club|app|us|biz|info)$/i, '');
     // TLD variants + the prefix/suffix patterns real businesses settle for when
     // the clean .com is taken (getX, joinX, X-app, Xhq, hyphenated, keyword TLD split)
     const wordSplit = baseName.replace(/([a-z])(club|app|hub|lab|labs|shop|store)$/i, '$1.$2');
     const candidates = [...new Set([
-      `${baseName}.net`, `${baseName}.co`, `${baseName}.org`, `${baseName}.club`,
-      `${baseName}.io`, `${baseName}.app`, `${baseName}.us`, `${baseName}.biz`,
+      ...UPGRADE_TLDS.map(t => `${baseName}.${t}`),
       `get${baseName}.com`, `join${baseName}.com`, `try${baseName}.com`, `my${baseName}.com`,
       `${baseName}app.com`, `${baseName}hq.com`,
       ...(wordSplit !== baseName ? [wordSplit] : []),
@@ -3270,7 +3284,7 @@ export async function runDailyIngestChain(budgetMs = 270000): Promise<Record<str
   // with a vaguely-related title (e.g. every Pilates studio owner) — demographic, not
   // intent. Use the intent-based sources below (funding/rebrand triggers, upgrade,
   // name-match, Reddit WTB) which target buyers in an actual naming moment.
-  if (left() > 90000) out.upgrade = await findUpgradeBuyers(targets);
+  if (left() > 90000) out.upgrade = await findUpgradeBuyers(targets, Math.min(60000, left() - 60000));
   if (left() > 90000) out.namematch = await findCompanyNameMatches(targets);
   if (left() > 90000) out.triggers = await findTriggerLeads(targets).catch(e => ({ error: (e as Error).message }));
   if (left() > 90000) out.reddit = await redditWtbLeads(targets).catch(e => ({ error: (e as Error).message }));
