@@ -2588,7 +2588,10 @@ export async function generateDailyReport(): Promise<string> {
   if (dmTasks.length) {
     lines.push('');
     lines.push(`DM TASKS — manual outreach (${dmTasks.length} pending):`);
-    for (const t of dmTasks) lines.push(`- [${t.channel}]${t.handle ? ` u/${t.handle}` : ''} "${t.title}" → ${t.url}`);
+    for (const t of dmTasks) {
+      lines.push(`- [${t.channel}]${t.handle ? ` u/${t.handle}` : ''} "${t.title}" → ${t.url}`);
+      lines.push(`  Done/dismiss: ${config.baseUrl.replace(/\/$/, '')}/api/task/done?dm=${encodeURIComponent(t.url)}`);
+    }
   }
 
   type RelayRow = { variant_domain: string; target_domain: string; registered_on: string | null; is_live: boolean; relay_url: string; suggested_message: string };
@@ -2601,6 +2604,7 @@ export async function generateDailyReport(): Promise<string> {
       lines.push(`- ${r.variant_domain}${held}${r.is_live ? ' [LIVE SITE]' : ''} → owner is a prospect for ${r.target_domain}`);
       lines.push(`  Relay form: ${r.relay_url}`);
       lines.push(`  Message to paste:\n  ${r.suggested_message.split('\n').join('\n  ')}`);
+      lines.push(`  ✓ Mark sent: ${config.baseUrl.replace(/\/$/, '')}/api/task/done?relay=${encodeURIComponent(r.variant_domain)}`);
     }
   }
 
@@ -3083,7 +3087,11 @@ export async function redditWtbLeads(targetDomains?: string[]): Promise<{ insert
   let via = 'direct';
   let error = direct.error;
   if (!leads.length && direct.error?.includes('403') && config.apifyApiKey) {
-    const serp = await discoverRedditWtbViaGoogle();
+    // Only the domain's own niche words signal relevance — drop generic domain jargon
+    // so "looking for a non-alcoholic beer domain" doesn't surface for indikaclub.com.
+    const generic = new Set(['domain', 'domains', 'name', 'names', 'brand', 'brands', 'website', 'online', 'business', 'company', 'premium', 'digital']);
+    const relevantKws = [...kwSet].filter(w => w.length > 3 && !generic.has(w));
+    const serp = await discoverRedditWtbViaGoogle(relevantKws);
     dmPosts = serp.dmPosts;
     via = 'google-serp';
     error = serp.error;
@@ -3105,7 +3113,7 @@ export async function redditWtbLeads(targetDomains?: string[]): Promise<{ insert
 
 // Reddit WTB discovery via Google SERP (Apify google-search-scraper). Yields
 // post URL + title for a manual DM — posts rarely contain emails anyway.
-async function discoverRedditWtbViaGoogle(): Promise<{ dmPosts: { title: string; url: string }[]; error?: string }> {
+async function discoverRedditWtbViaGoogle(relevantKws: string[] = []): Promise<{ dmPosts: { title: string; url: string }[]; error?: string }> {
   const since = new Date(Date.now() - 90 * 86400000).toISOString().slice(0, 10);
   const queries = [
     `site:reddit.com/r/domainnames (WTB OR buying OR "looking for") after:${since}`,
@@ -3143,6 +3151,9 @@ async function discoverRedditWtbViaGoogle(): Promise<{ dmPosts: { title: string;
         // Only actual purchase intent about domain NAMES — SERPs return plenty of adjacent noise
         if (!intentRe.test(title) || !/domain|\.com\b|brand name/i.test(title)) continue;
         if (/co-?founder|job|hire|hiring|career|hosting|email|expert|engineer|developer|course|learn/i.test(title)) continue;
+        // Relevance gate: the post must touch the domain's actual niche, else it's a
+        // domain-buying post for something unrelated (beer, an expired .com, etc.)
+        if (relevantKws.length && !relevantKws.some(kw => title.toLowerCase().includes(kw))) continue;
         seen.add(r.url);
         dmPosts.push({ title, url: r.url });
       }
