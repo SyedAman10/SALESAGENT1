@@ -12,7 +12,8 @@ export function proxy(req: NextRequest) {
   const isAppHost = !host || host === 'localhost' || host === '127.0.0.1' || host.endsWith('.vercel.app') || host === appHost;
   const { pathname } = req.nextUrl;
 
-  if (isAppHost || pathname.startsWith('/api') || pathname.startsWith('/buy') || pathname.startsWith('/_next')) {
+  if (isAppHost || pathname.startsWith('/api') || pathname.startsWith('/buy') || pathname.startsWith('/_next')
+      || pathname === '/robots.txt' || pathname === '/sitemap.xml') {
     return NextResponse.next();
   }
   return NextResponse.rewrite(new URL(`/buy/${host}`, req.url));

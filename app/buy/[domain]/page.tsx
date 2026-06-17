@@ -6,7 +6,19 @@ import BuyWidget from './widget';
 export async function generateMetadata({ params }: { params: Promise<{ domain: string }> }): Promise<Metadata> {
   const { domain } = await params;
   const decoded = decodeURIComponent(domain).toLowerCase();
-  return { title: `${decoded} is for sale`, description: `Buy ${decoded} — premium brandable domain.` };
+  const asset = getStorefrontAsset(decoded);
+  const title = `${decoded} is for sale`;
+  const description = asset
+    ? `Buy ${decoded} for $${asset.asking_price.toLocaleString()} — ${asset.description}`
+    : `Buy ${decoded} — premium brandable domain.`;
+  const url = `https://${decoded}/`;
+  return {
+    title,
+    description,
+    alternates: { canonical: url },
+    openGraph: { title, description, url, type: 'website', siteName: decoded },
+    twitter: { card: 'summary_large_image', title, description },
+  };
 }
 
 export default async function BuyPage({ params }: { params: Promise<{ domain: string }> }) {
@@ -18,8 +30,26 @@ export default async function BuyPage({ params }: { params: Promise<{ domain: st
   const analysis = await getAnalysisSummary(decoded).catch(() => null);
   const deadlineActive = asset.deadline && new Date(`${asset.deadline}T23:59:59Z`).getTime() >= Date.now();
 
+  // Structured data: lets search engines understand this is a domain for sale and
+  // surface it as a product result — the discovery a marketplace would otherwise provide.
+  const jsonLd = {
+    '@context': 'https://schema.org',
+    '@type': 'Product',
+    name: asset.domain,
+    description: analysis?.one_liner ?? asset.description,
+    category: 'Domain name',
+    offers: {
+      '@type': 'Offer',
+      price: asset.asking_price,
+      priceCurrency: 'USD',
+      availability: 'https://schema.org/InStock',
+      url: `https://${asset.domain}/`,
+    },
+  };
+
   return (
     <main className="min-h-screen bg-zinc-950 text-zinc-100 flex flex-col items-center px-4 py-16">
+      <script type="application/ld+json" dangerouslySetInnerHTML={{ __html: JSON.stringify(jsonLd) }} />
       <div className="w-full max-w-2xl">
         <p className="text-sm uppercase tracking-widest text-zinc-500 mb-3">This domain is for sale</p>
         <h1 className="text-4xl sm:text-5xl font-bold tracking-tight mb-4">{asset.domain}</h1>
