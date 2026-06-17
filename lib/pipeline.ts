@@ -3164,6 +3164,76 @@ async function discoverRedditWtbViaGoogle(relevantKws: string[] = []): Promise<{
   }
 }
 
+// ── HACKER NEWS WTB ───────────────────────────────────────────────────────────
+// Founders in a naming moment ask HN for help ("Ask HN: what should I name…",
+// "looking for a domain"). Free Algolia API — no scraping, no anti-bot. Each post
+// is matched against the WHOLE portfolio's niche keywords and surfaced as a manual
+// DM task tagged with whichever domains fit, so it scales with inventory.
+type HnHit = { objectID: string; title?: string; url?: string | null; author?: string; story_text?: string | null; comment_text?: string | null };
+
+export async function hackerNewsWtbLeads(targetDomains?: string[]): Promise<{ found: number; dmTasks: number; matched: number; error?: string }> {
+  const portfolio = loadPortfolio(targetDomains);
+  const generic = new Set(['domain', 'domains', 'name', 'names', 'brand', 'brands', 'website', 'online', 'business', 'company', 'premium', 'digital', 'startup', 'startups', 'product']);
+  const domainKws: { domain: string; kws: string[] }[] = [];
+  for (const asset of portfolio) {
+    const base = asset.domain.split('.')[0].toLowerCase();
+    const kw = new Set<string>([base]);
+    const suffix = base.match(/(club|app|hub|lab|shop|store)$/i)?.[1];
+    if (suffix) { kw.add(suffix); kw.add(base.slice(0, -suffix.length)); }
+    const analysis = await getDomainAnalysis(asset.domain);
+    if (analysis) {
+      [...analysis.industries, ...analysis.use_cases]
+        .flatMap(s => s.toLowerCase().split(/[\s,/&]+/))
+        .filter(w => w.length > 3)
+        .slice(0, 20)
+        .forEach(w => kw.add(w));
+    }
+    domainKws.push({ domain: asset.domain, kws: [...kw].filter(w => w.length > 3 && !generic.has(w)) });
+  }
+
+  const since = Math.floor(Date.now() / 1000) - 21 * 86400;
+  // Active seeking only — passive mentions ("domain name", "brand name") match
+  // meta-discussion about domains, not people who actually want one.
+  const intentRe = /\b(buy(ing)? a domain|register(ing)? a domain|looking for a (domain|name)|need a (domain|name)|what (should i|to) (call|name)|name for (my|our|a)|help (me )?name|suggest(ions)? for a name|naming (my|our|a) (startup|company|product|brand|app|tool|project))\b/i;
+  const queries = ['domain name', 'what should i name', 'name for my', 'looking for a domain', 'naming my startup'];
+
+  const hits = new Map<string, HnHit>();
+  try {
+    for (const q of queries) {
+      const res = await axios.get('https://hn.algolia.com/api/v1/search_by_date', {
+        params: { query: q, tags: 'story', numericFilters: `created_at_i>${since}`, hitsPerPage: 50, advancedSyntax: true },
+        timeout: 15000,
+      });
+      for (const h of (res.data?.hits ?? []) as HnHit[]) if (h.objectID) hits.set(h.objectID, h);
+      await sleep(300);
+    }
+  } catch (e) {
+    return { found: 0, dmTasks: 0, matched: 0, error: (e as Error).message };
+  }
+
+  let dmTasks = 0;
+  let matched = 0;
+  for (const h of hits.values()) {
+    const title = (h.title ?? '').replace(/<[^>]+>/g, ' ');
+    // Show/Launch HN are finished products, not someone seeking a name — skip them
+    if (/^\s*(show|launch)\s+hn/i.test(title)) continue;
+    const text = `${title} ${h.story_text ?? ''} ${h.comment_text ?? ''}`.replace(/<[^>]+>/g, ' ');
+    if (!intentRe.test(text)) continue;
+    // Relevance matches the TITLE only — the body is too noisy and yields false hits
+    const lcTitle = title.toLowerCase();
+    const fit = domainKws.filter(d => d.kws.some(kw => lcTitle.includes(kw))).map(d => d.domain);
+    if (!fit.length) continue;
+    matched++;
+    const url = `https://news.ycombinator.com/item?id=${h.objectID}`;
+    const rows = await sql`
+      INSERT INTO dm_tasks (channel, url, handle, title, target_domain)
+      VALUES ('hn', ${url}, ${h.author ?? null}, ${(h.title ?? 'HN post').slice(0, 200)}, ${fit.join(', ')})
+      ON CONFLICT (url) DO NOTHING RETURNING id`;
+    if (rows.length) dmTasks++;
+  }
+  return { found: hits.size, dmTasks, matched };
+}
+
 // ── DAILY INGEST CHAIN ────────────────────────────────────────────────────────
 // Time-budgeted front-of-funnel run for cron: find fresh buyers for closing-mode
 // domains, then enrich → match → write → decide. Every step is resumable, so
@@ -3189,6 +3259,7 @@ export async function runDailyIngestChain(budgetMs = 270000): Promise<Record<str
   if (left() > 90000) out.namematch = await findCompanyNameMatches(targets);
   if (left() > 90000) out.triggers = await findTriggerLeads(targets).catch(e => ({ error: (e as Error).message }));
   if (left() > 90000) out.reddit = await redditWtbLeads(targets).catch(e => ({ error: (e as Error).message }));
+  if (left() > 60000) out.hn = await hackerNewsWtbLeads(targets).catch(e => ({ error: (e as Error).message }));
   if (left() > 90000) out.enrich = await enrichLeads();
   if (left() > 60000) out.match = await matchDomains(targets);
   if (left() > 40000) out.write = await writeEmails(left() - 20000);
