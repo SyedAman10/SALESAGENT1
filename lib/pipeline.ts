@@ -2492,7 +2492,9 @@ export async function findTriggerLeads(targetDomains?: string[]): Promise<{ inse
     const niches = analysis.industries.filter(i => !GENERIC_INDUSTRY_RE.test(i.trim()));
     const useIndustries = (niches.length ? niches : analysis.industries).slice(0, 3);
     for (const industry of useIndustries) {
-      const query = `"${industry}" startup ("raises" OR "series a" OR "seed round" OR "rebrand")`;
+      // Any naming/branding moment — not just funding. New launches, openings, and
+      // freshly-licensed businesses are the highest-intent buyers (they have no domain yet).
+      const query = `"${industry}" ("raises" OR "series a" OR "seed round" OR "rebrand" OR "launches" OR "now open" OR "grand opening" OR "awarded license" OR "new dispensary" OR "debuts")`;
       try {
         const res = await axios.get(`https://news.google.com/rss/search?q=${encodeURIComponent(query)}&hl=en-US&gl=US&ceid=US:en`, {
           headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' },
@@ -2505,11 +2507,11 @@ export async function findTriggerLeads(targetDomains?: string[]): Promise<{ inse
 
         const extract = await client.messages.create({
           model: config.model, max_tokens: 512,
-          messages: [{ role: 'user', content: `Extract company names from these news headlines about funding/rebrands in the "${industry}" space. Only companies that RAISED money or are REBRANDING — not investors, not acquirers.
+          messages: [{ role: 'user', content: `Extract company names from these "${industry}" news headlines. Keep ONLY businesses in a naming/branding moment: just RAISED money, REBRANDED, LAUNCHED, OPENED a new location/store, or were AWARDED a license. Exclude investors, acquirers, regulators, and established incumbents just making announcements.
 
 ${titles.slice(0, 25).map((t, i) => `${i + 1}. ${t}`).join('\n')}
 
-Return JSON only: [{"company": "...", "trigger": "short description, e.g. raised $8M Series A (June 2026)"}]
+Return JSON only: [{"company": "...", "trigger": "short description, e.g. raised $8M Series A / just opened in Denver / awarded dispensary license"}]
 Max 8. Return [] if none.` }],
         });
         const text = extract.content[0].type === 'text' ? extract.content[0].text : '[]';
