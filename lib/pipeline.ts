@@ -1313,18 +1313,21 @@ function nicheMapsQueries(analysis: DomainAnalysis): string[] {
     .filter(s => s.length > 3 && s.length <= 40 && !abstract.test(s));
 }
 
-async function getGoogleMapsBusinesses(searchTerms: string[]): Promise<{ name?: string; website?: string; address?: string }[]> {
+type MapsBusiness = { name?: string; website?: string; address?: string; phone?: string; emails?: string[]; mapsUrl?: string };
+
+async function getGoogleMapsBusinesses(searchTerms: string[]): Promise<MapsBusiness[]> {
   if (!config.apifyApiKey || !searchTerms.length) return [];
 
   try {
     const runRes = await axios.post(
       `https://api.apify.com/v2/acts/compass~crawler-google-places/runs?token=${config.apifyApiKey}`,
-      { searchStringsArray: searchTerms.slice(0, 8), maxCrawledPlacesPerSearch: 12, language: 'en', countryCode: 'us', skipClosedPlaces: true },
+      // scrapeContacts pulls emails/socials off each business website during the run
+      { searchStringsArray: searchTerms.slice(0, 12), maxCrawledPlacesPerSearch: 12, language: 'en', countryCode: 'us', skipClosedPlaces: true, scrapeContacts: true },
       { timeout: 20000 }
     );
     const runId: string = runRes.data?.data?.id;
     if (!runId) return [];
-    for (let i = 0; i < 36; i++) {
+    for (let i = 0; i < 48; i++) {
       await sleep(5000);
       const st = await axios.get(`https://api.apify.com/v2/actor-runs/${runId}?token=${config.apifyApiKey}`);
       const status: string = st.data?.data?.status;
@@ -1332,8 +1335,10 @@ async function getGoogleMapsBusinesses(searchTerms: string[]): Promise<{ name?: 
       if (status === 'FAILED' || status === 'ABORTED') return [];
     }
     const items = await axios.get(`https://api.apify.com/v2/actor-runs/${runId}/dataset/items?token=${config.apifyApiKey}`);
-    return (items.data as { title?: string; website?: string; address?: string }[]).map(i => ({
+    type Item = { title?: string; website?: string; address?: string; phone?: string; phoneUnformatted?: string; emails?: string[]; url?: string };
+    return (items.data as Item[]).map(i => ({
       name: i.title, website: i.website, address: i.address,
+      phone: i.phone ?? i.phoneUnformatted, emails: i.emails, mapsUrl: i.url,
     }));
   } catch (err) {
     console.error('[GMaps]', (err as Error).message);
@@ -1399,19 +1404,18 @@ async function extractBusinessEmail(websiteUrl: string): Promise<string | null> 
   return null;
 }
 
-// Biggest US legal-cannabis markets by retail revenue — first 4 cover the bulk of
-// licensed dispensaries / CBD retail. Top 2 niche queries × these = 8 Maps searches.
-const MAPS_LOCATIONS = ['California', 'Colorado', 'Michigan', 'Oregon'];
+// Biggest US legal-cannabis markets by retail revenue — top 2 niche queries × these
+// gives broad market coverage (capped at 12 Maps searches in getGoogleMapsBusinesses).
+const MAPS_LOCATIONS = ['California', 'Colorado', 'Michigan', 'Oregon', 'Massachusetts', 'Illinois'];
 
 // Pure Apify workflow: Google Maps → contact page scraping → real end-user business
 // emails (no Apollo). Niche queries are deduped across the whole portfolio, so a
 // 55-domain CBD portfolio runs ONE Maps search of the shared niche instead of 55.
 export async function testApifyApollo(targetDomains?: string[], budgetMs = 120000): Promise<{ inserted: number; skipped: number; sources: Record<string, number>; breakdown: Record<string, number>; errors: Record<string, string> }> {
-  const start = Date.now();
   const portfolio = loadPortfolio(targetDomains);
   const allLeads: RawLead[] = [];
   const seen = new Set<string>();
-  const breakdown: Record<string, number> = { 'googlemaps:found': 0, 'googlemaps:with-website': 0, 'contact:emails': 0 };
+  const breakdown: Record<string, number> = { 'googlemaps:found': 0, 'googlemaps:with-website': 0, 'contact:emails': 0, 'call:tasks': 0 };
   const errors: Record<string, string> = {};
 
   // Phase 0: collect deduped physical-business queries across the portfolio
@@ -1428,33 +1432,49 @@ export async function testApifyApollo(targetDomains?: string[], budgetMs = 12000
   const cannaRe = /cbd|cannabis|dispensar|hemp|weed|marijuana|smoke ?shop|head ?shop|kush|420/i;
   const ranked = [...queries].sort((a, b) => (cannaRe.test(b) ? 1 : 0) - (cannaRe.test(a) ? 1 : 0));
   const topQueries = ranked.slice(0, 2);
+  // Rotate through 3 markets per run (scrapeContacts makes the Maps run slow) so
+  // coverage spreads across the markets over successive runs without overrunning.
+  const locs = [...MAPS_LOCATIONS].sort(() => Math.random() - 0.5).slice(0, 3);
   const searchQueries: string[] = [];
-  for (const loc of MAPS_LOCATIONS) for (const q of topQueries) searchQueries.push(`${q} ${loc}`);
+  for (const loc of locs) for (const q of topQueries) searchQueries.push(`${q} ${loc}`);
 
-  // Phase 1: one Google Maps run over the location-targeted niche
+  // Phase 1: one Google Maps run (with website contact enrichment) over the markets
   const businesses = await getGoogleMapsBusinesses(searchQueries.length ? searchQueries : [...queries]);
   breakdown['googlemaps:found'] = businesses.length;
-  const withWebsite = businesses.filter(b => b.website);
-  breakdown['googlemaps:with-website'] = withWebsite.length;
+  breakdown['googlemaps:with-website'] = businesses.filter(b => b.website).length;
 
-  // Phase 2: extract a real contact email from each business site (time-boxed)
-  for (const biz of withWebsite) {
-    if (Date.now() - start > budgetMs) break;
-    try {
-      const email = await extractBusinessEmail(biz.website!);
-      if (email && !seen.has(email)) {
-        seen.add(email);
-        breakdown['contact:emails']++;
-        allLeads.push({
-          name: biz.name ?? email.split('@')[0],
-          email,
-          company: biz.name,
-          source: 'apify:googlemaps',
-          raw_data: { website: biz.website, address: biz.address, source: 'google-maps-contact' },
-        });
+  // Phase 2: the actor already enriched each site for emails (scrapeContacts), so this
+  // is pure DB work — businesses with an email become leads; the rest (phone only,
+  // ~the majority of dispensaries) become manual call tasks instead of being dropped.
+  const phase2Start = Date.now();
+  let callTasks = 0;
+  for (const biz of businesses) {
+    if (Date.now() - phase2Start > budgetMs) break;
+    const email = (biz.emails ?? [])
+      .map(e => e?.toLowerCase().trim())
+      .find(e => !!e && e.includes('@') && !/^(noreply|no-reply|donotreply)/.test(e));
+
+    if (email && !seen.has(email)) {
+      seen.add(email);
+      breakdown['contact:emails']++;
+      allLeads.push({
+        name: biz.name ?? email.split('@')[0],
+        email,
+        company: biz.name,
+        source: 'apify:googlemaps',
+        raw_data: { website: biz.website, address: biz.address, phone: biz.phone, source: 'google-maps-contact' },
+      });
+    } else if (!email && (biz.phone || biz.website) && callTasks < 80) {
+      const key = biz.website ?? biz.mapsUrl;
+      if (key && !seen.has(key)) {
+        seen.add(key);
+        const ins = await sql`
+          INSERT INTO dm_tasks (channel, url, handle, title, target_domain)
+          VALUES ('call', ${key}, ${biz.phone ?? null}, ${`${biz.name ?? 'Cannabis business'}${biz.address ? ' — ' + biz.address : ''}`.slice(0, 200)}, ${null})
+          ON CONFLICT (url) DO NOTHING RETURNING id`;
+        if (ins.length) { callTasks++; breakdown['call:tasks']++; }
       }
-    } catch { /* skip */ }
-    await sleep(400);
+    }
   }
 
   const { inserted, skipped } = await upsertLeads(allLeads);
@@ -3401,9 +3421,8 @@ export async function runDailyIngestChain(budgetMs = 270000): Promise<Record<str
   if (left() > 90000) out.reddit = await redditWtbLeads(targets).catch(e => ({ error: (e as Error).message }));
   if (left() > 60000) out.hn = await hackerNewsWtbLeads(targets).catch(e => ({ error: (e as Error).message }));
   if (left() > 60000) out.x = await xWtbLeads(targets).catch(e => ({ error: (e as Error).message }));
-  // End-user business scraping (Google Maps → public contact emails) — only with
-  // ample headroom; the Apify Maps run is slow. Time-boxed internally.
-  if (left() > 150000) out.business = await testApifyApollo(targets, left() - 90000).catch(e => ({ error: (e as Error).message }));
+  // Note: the Google Maps business scraper runs in its own cron (/api/cron/business)
+  // — its scrapeContacts run is too slow (~4min) to sit inside this chain.
   if (left() > 90000) out.enrich = await enrichLeads();
   if (left() > 60000) out.match = await matchDomains(targets);
   if (left() > 40000) out.write = await writeEmails(left() - 20000);

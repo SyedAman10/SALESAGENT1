@@ -974,7 +974,7 @@ export default function Dashboard() {
                     {manualTasks.dmTasks.map(t => (
                       <div key={t.url} className="bg-gray-900 border border-gray-800 rounded-lg p-3 flex items-start justify-between gap-3">
                         <div className="min-w-0">
-                          <p className="text-gray-200 text-xs">[{t.channel}]{t.handle ? ` u/${t.handle}` : ''} {t.title}</p>
+                          <p className="text-gray-200 text-xs">[{t.channel}]{t.handle ? ` ${t.channel === 'call' ? '📞 ' : t.channel === 'x' ? '@' : 'u/'}${t.handle}` : ''} {t.title}</p>
                           <a href={t.url} target="_blank" rel="noopener noreferrer" className="text-blue-500 hover:text-blue-400 text-xs break-all">{t.url} ↗</a>
                           {t.target_domain && <span className="text-gray-600 text-xs ml-2">→ {t.target_domain}</span>}
                         </div>
