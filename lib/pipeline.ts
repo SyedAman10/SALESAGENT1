@@ -1522,13 +1522,25 @@ export async function weedmapsLeads(maxPerLocation = 25): Promise<{ leads: numbe
     dispensaries = r.data as WeedmapsDispensary[];
   } catch (e) { return { leads: 0, callTasks: 0, found: 0, error: (e as Error).message }; }
 
+  // Change detection: a dispensary is "newly listed" only if it's unseen AND we've
+  // scraped its state before (else it's just the first time we covered that market).
+  const seenRows = await sql`SELECT id FROM seen_dispensaries` as { id: string }[];
+  const seenIds = new Set(seenRows.map(r => r.id));
+  const scrapedStates = new Set((await sql`SELECT DISTINCT state FROM seen_dispensaries` as { state: string | null }[]).map(r => r.state));
+
   const allLeads: RawLead[] = [];
   const seen = new Set<string>();
   let callTasks = 0;
   for (const d of dispensaries) {
     const email = (d.email ?? '').toLowerCase().trim();
     const addr = [d.address, d.city, d.state, d.zip_code].filter(Boolean).join(', ');
-    const raw = { website: d.web_url, address: addr, phone: d.phone_number, license_type: d.license_type, ...webIntentSignal(d.web_url), source: 'weedmaps' };
+    const dispId = d.id ?? d.slug ?? `${d.name}-${d.zip_code}`;
+    const newlyListed = !seenIds.has(dispId) && scrapedStates.has(d.state ?? null);
+    if (dispId && !seenIds.has(dispId)) {
+      seenIds.add(dispId);
+      await sql`INSERT INTO seen_dispensaries (id, state) VALUES (${dispId}, ${d.state ?? null}) ON CONFLICT (id) DO NOTHING`;
+    }
+    const raw = { website: d.web_url, address: addr, phone: d.phone_number, license_type: d.license_type, ...webIntentSignal(d.web_url), newly_listed: newlyListed, source: 'weedmaps' };
     if (email && email.includes('@') && !/^(noreply|no-reply|donotreply)/.test(email) && !PLATFORM_EMAIL_RE.test(email) && !seen.has(email)) {
       seen.add(email);
       allLeads.push({ name: d.name ?? email.split('@')[0], email, company: d.name, source: 'weedmaps', raw_data: raw });
@@ -1868,6 +1880,7 @@ Scoring rules:
 - Celebrities, billionaires, VC partners, and Fortune-500 executives score UNDER 20 — they do not buy small domains from cold email, regardless of industry fit.
 - The sweet spot (70+) is founders/owners of small companies (<50 people) actively building in a matching niche.
 - Weight the "naming_intent" signal if present: "high" (no website, social-only page, or a website-builder subdomain) means the business genuinely NEEDS a real domain → score higher; "low" (already on an established .com) means it already has a brand → score lower. "non-com"/"medium" owners of a worse TLD are upgrade prospects → score moderately high.
+- "newly_listed": true means this business was just detected (a likely new/recent opening) — a naming moment → score higher.
 Only use facts from the data. Return valid JSON only.`;
 }
 

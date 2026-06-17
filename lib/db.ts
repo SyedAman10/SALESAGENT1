@@ -226,4 +226,12 @@ export async function initDb(): Promise<void> {
   await db`ALTER TABLE replies ADD COLUMN IF NOT EXISTS gmail_account TEXT`;
   await db`ALTER TABLE gmail_accounts ADD COLUMN IF NOT EXISTS is_active BOOLEAN NOT NULL DEFAULT true`;
   await db`ALTER TABLE gmail_accounts ADD COLUMN IF NOT EXISTS daily_limit INTEGER NOT NULL DEFAULT 30`;
+
+  // Change detection for the Weedmaps source: a dispensary newly appearing (in a
+  // market already scraped before) is a recency/naming signal — a likely new opening.
+  await db`CREATE TABLE IF NOT EXISTS seen_dispensaries (
+    id TEXT PRIMARY KEY,
+    state TEXT,
+    first_seen TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  )`;
 }
