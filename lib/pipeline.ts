@@ -1304,18 +1304,22 @@ export async function testNewSources(targetDomains?: string[]): Promise<{ insert
   return { inserted, skipped, breakdown, errors };
 }
 
-async function getGoogleMapsBusinesses(analysis: DomainAnalysis): Promise<{ name?: string; website?: string; address?: string }[]> {
-  if (!config.apifyApiKey) return [];
-  const searchTerms = [
-    ...analysis.industries.slice(0, 2),
-    ...analysis.ideal_buyer_types.filter(t => !t.toLowerCase().includes('domain') && !t.toLowerCase().includes('broker')).slice(0, 2),
-  ].filter(Boolean);
-  if (!searchTerms.length) return [];
+// Physical-business search queries for Google Maps — drop abstract buyer-type
+// phrases ("startup founder", "platform") that Maps can't resolve to real places.
+function nicheMapsQueries(analysis: DomainAnalysis): string[] {
+  const abstract = /startup|founder|investor|platform|\bbrand\b|company|online|e-?commerce|saas|\bapp\b|software|website|domain|developer|entrepreneur/i;
+  return [...new Set([...analysis.industries, ...analysis.use_cases])]
+    .map(s => s.trim())
+    .filter(s => s.length > 3 && s.length <= 40 && !abstract.test(s));
+}
+
+async function getGoogleMapsBusinesses(searchTerms: string[]): Promise<{ name?: string; website?: string; address?: string }[]> {
+  if (!config.apifyApiKey || !searchTerms.length) return [];
 
   try {
     const runRes = await axios.post(
-      `https://api.apify.com/v2/acts/apify~google-maps-scraper/runs?token=${config.apifyApiKey}`,
-      { searchStringsArray: searchTerms.slice(0, 4), maxCrawledPlaces: 20, language: 'en', countryCode: 'us', maxImages: 0, additionalInfo: false },
+      `https://api.apify.com/v2/acts/compass~crawler-google-places/runs?token=${config.apifyApiKey}`,
+      { searchStringsArray: searchTerms.slice(0, 8), maxCrawledPlacesPerSearch: 12, language: 'en', countryCode: 'us', skipClosedPlaces: true },
       { timeout: 20000 }
     );
     const runId: string = runRes.data?.data?.id;
@@ -1342,72 +1346,103 @@ const FILE_EXTS = new Set(['png','jpg','jpeg','gif','svg','webp','ico','bmp','pd
 async function extractBusinessEmail(websiteUrl: string): Promise<string | null> {
   const emailRegex = /[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}/g;
   const skipPrefixes = ['noreply', 'no-reply', 'donotreply', 'webmaster', 'postmaster'];
-  const skipDomains = ['example.com', 'sentry.io', 'cloudflare.com', 'google.com', 'w3.org', 'schema.org', 'apple.com', 'wix.com', 'squarespace.com'];
+  // Suffix-matched against the email's domain (catches subdomains like *.fbcdn.net)
+  const skipDomains = ['example.com', 'sentry.io', 'cloudflare.com', 'google.com', 'w3.org', 'schema.org', 'apple.com', 'wix.com', 'squarespace.com',
+    'fbcdn.net', 'fbsbx.com', 'facebook.com', 'instagram.com', 'googleusercontent.com', 'gstatic.com', 'cloudfront.net', 'akamaihd.net', 'jsdelivr.net', 'gravatar.com', 'wp.com', 'sentry-cdn.com', 'wixpress.com'];
 
   function isRealEmail(e: string): boolean {
     const tld = e.split('.').pop()?.toLowerCase() ?? '';
     if (FILE_EXTS.has(tld)) return false;
     if (!/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(e)) return false;
     if (e.includes('..') || e.startsWith('.') || e.includes('@.')) return false;
+    const eDomain = e.split('@')[1] ?? '';
+    if (skipDomains.some(d => eDomain === d || eDomain.endsWith(`.${d}`))) return false;
     return true;
   }
+  // Social/aggregator pages aren't real sites — scraping them yields CDN garbage
+  const SOCIAL_HOST = /(facebook|instagram|twitter|linkedin|yelp|tiktok|youtube|pinterest|maps\.google|wa\.me|t\.me|m\.me)\./i;
+  if (SOCIAL_HOST.test(websiteUrl)) return null;
   const domain = websiteUrl.replace(/^https?:\/\/(www\.)?/, '').split('/')[0].toLowerCase();
+  const siteRoot = domain.replace(/^www\./, '');
   const base = `https://${domain}`;
-  for (const path of ['', '/contact', '/contact-us', '/about']) {
+
+  const pick = (html: string): string | null => {
+    // mailto: links are the highest-confidence signal; fall back to body text,
+    // de-obfuscating common "name [at] site dot com" tricks first.
+    const mailtos = [...html.matchAll(/mailto:([^"'?>\s]+)/gi)].map(m => m[1].toLowerCase());
+    const deobf = html.replace(/\s*\[?\(?\s*(at|@)\s*\)?\]?\s*/gi, '@').replace(/\s*\[?\(?\s*dot\s*\)?\]?\s*/gi, '.');
+    const body = (deobf.match(emailRegex) ?? []).map(e => e.toLowerCase());
+    const candidates = [...mailtos, ...body].filter(e =>
+      isRealEmail(e) && !skipPrefixes.some(p => e.startsWith(p))
+    );
+    if (!candidates.length) return null;
+    const ROLE = /^(hello|info|contact|sales|team|support|owner|founder|admin|hi)@/;
+    // Prefer an address on the business's own domain (any), then a role inbox.
+    const sameDomain = candidates.filter(e => e.endsWith(`@${siteRoot}`));
+    if (sameDomain.length) return sameDomain.find(e => ROLE.test(e)) ?? sameDomain[0];
+    // Cross-domain (e.g. a gmail on the contact page): only trust a role inbox —
+    // a bare personal/garbled address off-domain is usually a scraping artifact.
+    return candidates.find(e => ROLE.test(e)) ?? null;
+  };
+
+  for (const path of ['', '/contact', '/contact-us', '/contact.html', '/get-in-touch', '/about', '/about-us']) {
     try {
       const res = await axios.get(`${base}${path}`, {
         timeout: 6000,
         headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' },
         maxRedirects: 3,
       });
-      const emails = (res.data as string).match(emailRegex) ?? [];
-      const valid = emails.find(e =>
-        isRealEmail(e) &&
-        !skipDomains.some(d => e.endsWith(`@${d}`)) &&
-        !skipPrefixes.some(p => e.toLowerCase().startsWith(p))
-      );
+      const valid = pick(res.data as string);
       if (valid) return valid;
     } catch { continue; }
   }
   return null;
 }
 
-// Pure Apify workflow: Google Maps → contact page scraping → real business emails (no Apollo)
-export async function testApifyApollo(targetDomains?: string[]): Promise<{ inserted: number; skipped: number; sources: Record<string, number>; breakdown: Record<string, number>; errors: Record<string, string> }> {
+// Pure Apify workflow: Google Maps → contact page scraping → real end-user business
+// emails (no Apollo). Niche queries are deduped across the whole portfolio, so a
+// 55-domain CBD portfolio runs ONE Maps search of the shared niche instead of 55.
+export async function testApifyApollo(targetDomains?: string[], budgetMs = 120000): Promise<{ inserted: number; skipped: number; sources: Record<string, number>; breakdown: Record<string, number>; errors: Record<string, string> }> {
+  const start = Date.now();
   const portfolio = loadPortfolio(targetDomains);
   const allLeads: RawLead[] = [];
   const seen = new Set<string>();
   const breakdown: Record<string, number> = { 'googlemaps:found': 0, 'googlemaps:with-website': 0, 'contact:emails': 0 };
   const errors: Record<string, string> = {};
 
+  // Phase 0: collect deduped physical-business queries across the portfolio
+  const queries = new Set<string>();
   for (const asset of portfolio) {
     const analysis = await getDomainAnalysis(asset.domain);
     if (!analysis) { errors[asset.domain] = 'no analysis — run Analyze first'; continue; }
+    for (const q of nicheMapsQueries(analysis)) queries.add(q);
+  }
+  if (!queries.size) return { inserted: 0, skipped: 0, sources: {}, breakdown, errors };
 
-    // Phase 1: Google Maps → find relevant local businesses
-    const businesses = await getGoogleMapsBusinesses(analysis);
-    breakdown['googlemaps:found'] += businesses.length;
-    const withWebsite = businesses.filter(b => b.website);
-    breakdown['googlemaps:with-website'] += withWebsite.length;
+  // Phase 1: one Google Maps run over the shared niche
+  const businesses = await getGoogleMapsBusinesses([...queries]);
+  breakdown['googlemaps:found'] = businesses.length;
+  const withWebsite = businesses.filter(b => b.website);
+  breakdown['googlemaps:with-website'] = withWebsite.length;
 
-    // Phase 2: For each business website, extract contact email directly (no Apollo)
-    for (const biz of withWebsite.slice(0, 25)) {
-      try {
-        const email = await extractBusinessEmail(biz.website!);
-        if (email && !seen.has(email)) {
-          seen.add(email);
-          breakdown['contact:emails']++;
-          allLeads.push({
-            name: biz.name ?? email.split('@')[0],
-            email,
-            company: biz.name,
-            source: 'apify:googlemaps',
-            raw_data: { website: biz.website, address: biz.address, source: 'google-maps-contact' },
-          });
-        }
-      } catch { /* skip */ }
-      await sleep(600);
-    }
+  // Phase 2: extract a real contact email from each business site (time-boxed)
+  for (const biz of withWebsite) {
+    if (Date.now() - start > budgetMs) break;
+    try {
+      const email = await extractBusinessEmail(biz.website!);
+      if (email && !seen.has(email)) {
+        seen.add(email);
+        breakdown['contact:emails']++;
+        allLeads.push({
+          name: biz.name ?? email.split('@')[0],
+          email,
+          company: biz.name,
+          source: 'apify:googlemaps',
+          raw_data: { website: biz.website, address: biz.address, source: 'google-maps-contact' },
+        });
+      }
+    } catch { /* skip */ }
+    await sleep(400);
   }
 
   const { inserted, skipped } = await upsertLeads(allLeads);
@@ -3289,6 +3324,9 @@ export async function runDailyIngestChain(budgetMs = 270000): Promise<Record<str
   if (left() > 90000) out.triggers = await findTriggerLeads(targets).catch(e => ({ error: (e as Error).message }));
   if (left() > 90000) out.reddit = await redditWtbLeads(targets).catch(e => ({ error: (e as Error).message }));
   if (left() > 60000) out.hn = await hackerNewsWtbLeads(targets).catch(e => ({ error: (e as Error).message }));
+  // End-user business scraping (Google Maps → public contact emails) — only with
+  // ample headroom; the Apify Maps run is slow. Time-boxed internally.
+  if (left() > 150000) out.business = await testApifyApollo(targets, left() - 90000).catch(e => ({ error: (e as Error).message }));
   if (left() > 90000) out.enrich = await enrichLeads();
   if (left() > 60000) out.match = await matchDomains(targets);
   if (left() > 40000) out.write = await writeEmails(left() - 20000);
