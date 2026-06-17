@@ -1399,6 +1399,10 @@ async function extractBusinessEmail(websiteUrl: string): Promise<string | null> 
   return null;
 }
 
+// Biggest US legal-cannabis markets by retail revenue — first 4 cover the bulk of
+// licensed dispensaries / CBD retail. Top 2 niche queries × these = 8 Maps searches.
+const MAPS_LOCATIONS = ['California', 'Colorado', 'Michigan', 'Oregon'];
+
 // Pure Apify workflow: Google Maps → contact page scraping → real end-user business
 // emails (no Apollo). Niche queries are deduped across the whole portfolio, so a
 // 55-domain CBD portfolio runs ONE Maps search of the shared niche instead of 55.
@@ -1419,8 +1423,16 @@ export async function testApifyApollo(targetDomains?: string[], budgetMs = 12000
   }
   if (!queries.size) return { inserted: 0, skipped: 0, sources: {}, breakdown, errors };
 
-  // Phase 1: one Google Maps run over the shared niche
-  const businesses = await getGoogleMapsBusinesses([...queries]);
+  // Location-target the top niche queries at the biggest legal-cannabis markets so
+  // Maps returns real dispensaries/CBD shops, not arbitrary out-of-state businesses.
+  const cannaRe = /cbd|cannabis|dispensar|hemp|weed|marijuana|smoke ?shop|head ?shop|kush|420/i;
+  const ranked = [...queries].sort((a, b) => (cannaRe.test(b) ? 1 : 0) - (cannaRe.test(a) ? 1 : 0));
+  const topQueries = ranked.slice(0, 2);
+  const searchQueries: string[] = [];
+  for (const loc of MAPS_LOCATIONS) for (const q of topQueries) searchQueries.push(`${q} ${loc}`);
+
+  // Phase 1: one Google Maps run over the location-targeted niche
+  const businesses = await getGoogleMapsBusinesses(searchQueries.length ? searchQueries : [...queries]);
   breakdown['googlemaps:found'] = businesses.length;
   const withWebsite = businesses.filter(b => b.website);
   breakdown['googlemaps:with-website'] = withWebsite.length;
