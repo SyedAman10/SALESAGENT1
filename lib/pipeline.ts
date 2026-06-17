@@ -1411,6 +1411,22 @@ const MAPS_LOCATIONS = ['California', 'Colorado', 'Michigan', 'Oregon', 'Massach
 // Directory/platform emails (the listing's fallback, not the actual business)
 const PLATFORM_EMAIL_RE = /@(weedmaps|leafly|dutchie|iheartjane|jane|getsauce|tymber)\.(com|co|io)$/i;
 
+// Quality signal: a cannabis business with no site, a social-only page, or a
+// website-builder subdomain genuinely NEEDS a real domain — a far stronger buyer
+// than one already on a clean established .com. Injected into raw_data so enrich scores it.
+const SOCIAL_HOSTS = ['facebook.com', 'instagram.com', 'twitter.com', 'x.com', 'tiktok.com', 'yelp.com', 'linktr.ee', 'beacons.ai', 'linktree.com'];
+const BUILDER_HOSTS = ['wixsite.com', 'squarespace.com', 'myshopify.com', 'sites.google.com', 'weebly.com', 'godaddysites.com', 'business.site', 'wordpress.com', 'webflow.io', 'carrd.co', 'mystrikingly.com'];
+function webIntentSignal(url?: string | null): { web_quality: string; naming_intent: 'high' | 'medium' | 'low' } {
+  if (!url || !/[a-z]\.[a-z]/i.test(url)) return { web_quality: 'no-site', naming_intent: 'high' };
+  const host = url.toLowerCase().replace(/^https?:\/\/(www\.)?/, '').split('/')[0].split(':')[0];
+  const isHost = (list: string[]) => list.some(h => host === h || host.endsWith(`.${h}`));
+  if (isHost(SOCIAL_HOSTS)) return { web_quality: 'social-only', naming_intent: 'high' };
+  if (isHost(BUILDER_HOSTS)) return { web_quality: 'builder-subdomain', naming_intent: 'high' };
+  if (host.endsWith('.com')) return { web_quality: 'established-com', naming_intent: 'low' };
+  if (/\.(net|org|co|biz|info|us|shop|store)$/.test(host)) return { web_quality: 'non-com', naming_intent: 'medium' };
+  return { web_quality: 'other', naming_intent: 'medium' };
+}
+
 // Pure Apify workflow: Google Maps → contact page scraping → real end-user business
 // emails (no Apollo). Niche queries are deduped across the whole portfolio, so a
 // 55-domain CBD portfolio runs ONE Maps search of the shared niche instead of 55.
@@ -1465,7 +1481,7 @@ export async function testApifyApollo(targetDomains?: string[], budgetMs = 12000
         email,
         company: biz.name,
         source: 'apify:googlemaps',
-        raw_data: { website: biz.website, address: biz.address, phone: biz.phone, source: 'google-maps-contact' },
+        raw_data: { website: biz.website, address: biz.address, phone: biz.phone, ...webIntentSignal(biz.website), source: 'google-maps-contact' },
       });
     } else if (!email && (biz.phone || biz.website) && callTasks < 80) {
       const key = biz.website ?? biz.mapsUrl;
@@ -1512,7 +1528,7 @@ export async function weedmapsLeads(maxPerLocation = 25): Promise<{ leads: numbe
   for (const d of dispensaries) {
     const email = (d.email ?? '').toLowerCase().trim();
     const addr = [d.address, d.city, d.state, d.zip_code].filter(Boolean).join(', ');
-    const raw = { website: d.web_url, address: addr, phone: d.phone_number, license_type: d.license_type, source: 'weedmaps' };
+    const raw = { website: d.web_url, address: addr, phone: d.phone_number, license_type: d.license_type, ...webIntentSignal(d.web_url), source: 'weedmaps' };
     if (email && email.includes('@') && !/^(noreply|no-reply|donotreply)/.test(email) && !PLATFORM_EMAIL_RE.test(email) && !seen.has(email)) {
       seen.add(email);
       allLeads.push({ name: d.name ?? email.split('@')[0], email, company: d.name, source: 'weedmaps', raw_data: raw });
@@ -1831,7 +1847,7 @@ export async function enrichLeads(): Promise<{ enriched: number; skipped: number
 }
 
 function enrichPrompt(lead: LeadRow, rawData: unknown) {
-  return `You are analysing a domain investor lead. Extract structured intelligence.
+  return `You are analysing a potential domain buyer. Extract structured intelligence.
 
 Lead: ${lead.name}, Company: ${lead.company ?? 'unknown'}
 Data: ${JSON.stringify(rawData, null, 2)}
@@ -1848,9 +1864,10 @@ Return JSON only:
   "score_reasoning": "one sentence"
 }
 Scoring rules:
-- Score = likelihood this specific person would personally PURCHASE a $1k-5k domain for a real project.
+- Score = likelihood this specific business would PURCHASE a $1k-5k domain for a real project.
 - Celebrities, billionaires, VC partners, and Fortune-500 executives score UNDER 20 — they do not buy small domains from cold email, regardless of industry fit.
 - The sweet spot (70+) is founders/owners of small companies (<50 people) actively building in a matching niche.
+- Weight the "naming_intent" signal if present: "high" (no website, social-only page, or a website-builder subdomain) means the business genuinely NEEDS a real domain → score higher; "low" (already on an established .com) means it already has a brand → score lower. "non-com"/"medium" owners of a worse TLD are upgrade prospects → score moderately high.
 Only use facts from the data. Return valid JSON only.`;
 }
 
