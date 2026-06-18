@@ -3494,7 +3494,9 @@ export async function xWtbLeads(targetDomains?: string[]): Promise<{ found: numb
   // Niche-scoped search terms with a since: operator so X only returns recent tweets
   // (raw search otherwise dredges up years-old posts). Intent + relevance gates below.
   const since = new Date(Date.now() - 120 * 86400000).toISOString().slice(0, 10);
-  const queries = ['cbd brand name', 'cannabis brand name', 'naming my cbd', 'looking for a cannabis domain', 'need a name for my cbd']
+  // Portfolio-agnostic naming-intent queries — the relevance gate below matches hits
+  // to whichever domains fit, so this works for any portfolio (cannabis, tech, etc.).
+  const queries = ['what should i name my startup', 'need a domain name', 'looking for a brand name', 'naming my company', 'need a name for my app', 'startup name ideas']
     .map(q => `${q} since:${since}`);
   let tweets: XTweet[] = [];
   try {
