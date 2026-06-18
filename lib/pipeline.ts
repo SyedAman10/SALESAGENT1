@@ -1821,8 +1821,10 @@ export interface LeadEnrichment {
   score_reasoning: string;
 }
 
-export async function enrichLeads(): Promise<{ enriched: number; skipped: number; failed: number }> {
-  const leads = await sql`SELECT id, name, email, company, raw_data FROM leads WHERE enrichment IS NULL AND status = 'new'` as LeadRow[];
+export async function enrichLeads(limit?: number): Promise<{ enriched: number; skipped: number; failed: number }> {
+  const leads = (limit
+    ? await sql`SELECT id, name, email, company, raw_data FROM leads WHERE enrichment IS NULL AND status = 'new' ORDER BY score DESC NULLS LAST, id LIMIT ${limit}`
+    : await sql`SELECT id, name, email, company, raw_data FROM leads WHERE enrichment IS NULL AND status = 'new'`) as LeadRow[];
 
   let enriched = 0; let skipped = 0; let failed = 0;
   const BATCH = 5;
@@ -2851,6 +2853,79 @@ export async function decideAndApprove(): Promise<{ approved: number }> {
     }
   }
   return { approved };
+}
+
+// ── LEAD BATCH + COST METERING ────────────────────────────────────────────────
+// Runs enrich → match → write → decide on a bounded batch of new leads, meters
+// every Claude call (by wrapping client.messages.create for the duration), and
+// emails a per-lead cost report. Pricing $/1M tokens: Sonnet 4.6 in $3 / out $15,
+// Haiku 4.5 in $1 / out $5.
+const PRICE = { sonnetIn: 3, sonnetOut: 15, haikuIn: 1, haikuOut: 5 };
+type Meter = { sonnetIn: number; sonnetOut: number; haikuIn: number; haikuOut: number; calls: number };
+let _meter: Meter = { sonnetIn: 0, sonnetOut: 0, haikuIn: 0, haikuOut: 0, calls: 0 };
+
+function meterUsage(res: { usage?: { input_tokens?: number; output_tokens?: number; cache_read_input_tokens?: number; cache_creation_input_tokens?: number }; model?: string }): void {
+  const u = res?.usage;
+  if (!u) return;
+  const inTok = (u.input_tokens ?? 0) + (u.cache_read_input_tokens ?? 0) + (u.cache_creation_input_tokens ?? 0);
+  const outTok = u.output_tokens ?? 0;
+  if ((res.model ?? '').includes('haiku')) { _meter.haikuIn += inTok; _meter.haikuOut += outTok; }
+  else { _meter.sonnetIn += inTok; _meter.sonnetOut += outTok; }
+  _meter.calls++;
+}
+
+export async function runLeadBatch(limit = 25): Promise<{ enriched: number; skipped: number; approved: number; processed: number; totalCost: number; perLead: number; calls: number }> {
+  _meter = { sonnetIn: 0, sonnetOut: 0, haikuIn: 0, haikuOut: 0, calls: 0 };
+  // Wrap the SDK call to meter token usage across every step of this batch.
+  const orig = (client.messages as unknown as { create: (a: unknown) => Promise<unknown> }).create.bind(client.messages);
+  (client.messages as unknown as { create: (a: unknown) => Promise<unknown> }).create = async (a: unknown) => {
+    const res = await orig(a);
+    meterUsage(res as Parameters<typeof meterUsage>[0]);
+    return res;
+  };
+
+  let enriched = { enriched: 0, skipped: 0, failed: 0 };
+  let approved = { approved: 0 };
+  try {
+    enriched = await enrichLeads(limit);
+    await matchDomains();
+    await writeEmails();
+    approved = await decideAndApprove();
+  } finally {
+    (client.messages as unknown as { create: (a: unknown) => Promise<unknown> }).create = orig;
+  }
+
+  const processed = enriched.enriched + enriched.skipped + enriched.failed;
+  const sonnetCost = _meter.sonnetIn / 1e6 * PRICE.sonnetIn + _meter.sonnetOut / 1e6 * PRICE.sonnetOut;
+  const haikuCost = _meter.haikuIn / 1e6 * PRICE.haikuIn + _meter.haikuOut / 1e6 * PRICE.haikuOut;
+  const totalCost = sonnetCost + haikuCost;
+  const perLead = processed > 0 ? totalCost / processed : 0;
+  const totalIn = _meter.sonnetIn + _meter.haikuIn;
+  const totalOut = _meter.sonnetOut + _meter.haikuOut;
+
+  const to = config.reportEmail || 'amanullahnaqvi@gmail.com';
+  const body = [
+    `Lead batch processed through enrich → match → write → decide.`,
+    ``,
+    `Leads in batch:      ${processed}`,
+    `  · enriched (kept): ${enriched.enriched}`,
+    `  · skipped (low):   ${enriched.skipped}`,
+    `Emails approved:     ${approved.approved}`,
+    ``,
+    `── COST ──`,
+    `Total cost:          $${totalCost.toFixed(4)}`,
+    `Cost per lead:       $${perLead.toFixed(4)}`,
+    ``,
+    `Claude calls:        ${_meter.calls}`,
+    `Tokens in / out:     ${totalIn.toLocaleString()} / ${totalOut.toLocaleString()}`,
+    `Sonnet 4.6 cost:     $${sonnetCost.toFixed(4)}  (enrich/match/write/decide)`,
+    `Haiku 4.5 cost:      $${haikuCost.toFixed(4)}  (analysis)`,
+    ``,
+    `Pricing: Sonnet $3/$15 per 1M in/out, Haiku $1/$5 per 1M in/out.`,
+  ].join('\n');
+  await sendViaGmail({ to, subject: `Lead batch cost report — ${processed} leads, $${perLead.toFixed(4)}/lead`, body }).catch(e => console.error('[batch report]', (e as Error).message));
+
+  return { enriched: enriched.enriched, skipped: enriched.skipped, approved: approved.approved, processed, totalCost, perLead, calls: _meter.calls };
 }
 
 async function pickVariant(enrichment: LeadEnrichment, variants: { id: number; subject: string; body: string; variant: string }[]) {
