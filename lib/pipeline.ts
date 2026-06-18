@@ -1483,17 +1483,8 @@ export async function testApifyApollo(targetDomains?: string[], budgetMs = 12000
         source: 'apify:googlemaps',
         raw_data: { website: biz.website, address: biz.address, phone: biz.phone, ...webIntentSignal(biz.website), source: 'google-maps-contact' },
       });
-    } else if (!email && (biz.phone || biz.website) && callTasks < 80) {
-      const key = biz.website ?? biz.mapsUrl;
-      if (key && !seen.has(key)) {
-        seen.add(key);
-        const ins = await sql`
-          INSERT INTO dm_tasks (channel, url, handle, title, target_domain)
-          VALUES ('call', ${key}, ${biz.phone ?? null}, ${`${biz.name ?? 'Cannabis business'}${biz.address ? ' — ' + biz.address : ''}`.slice(0, 200)}, ${null})
-          ON CONFLICT (url) DO NOTHING RETURNING id`;
-        if (ins.length) { callTasks++; breakdown['call:tasks']++; }
-      }
     }
+    // Phone-only businesses are dropped — no call tasks (owner doesn't want to cold-call).
   }
 
   const { inserted, skipped } = await upsertLeads(allLeads);
@@ -1544,17 +1535,8 @@ export async function weedmapsLeads(maxPerLocation = 25): Promise<{ leads: numbe
     if (email && email.includes('@') && !/^(noreply|no-reply|donotreply)/.test(email) && !PLATFORM_EMAIL_RE.test(email) && !seen.has(email)) {
       seen.add(email);
       allLeads.push({ name: d.name ?? email.split('@')[0], email, company: d.name, source: 'weedmaps', raw_data: raw });
-    } else if (!email && (d.phone_number || d.web_url) && callTasks < 80) {
-      const key = d.web_url || `weedmaps:${d.id ?? d.slug ?? d.name}`;
-      if (key && !seen.has(key)) {
-        seen.add(key);
-        const ins = await sql`
-          INSERT INTO dm_tasks (channel, url, handle, title, target_domain)
-          VALUES ('call', ${key}, ${d.phone_number ?? null}, ${`${d.name ?? 'Dispensary'}${addr ? ' — ' + addr : ''}`.slice(0, 200)}, ${null})
-          ON CONFLICT (url) DO NOTHING RETURNING id`;
-        if (ins.length) callTasks++;
-      }
     }
+    // Phone-only dispensaries are dropped — no call tasks (owner doesn't cold-call).
   }
   const { inserted } = await upsertLeads(allLeads);
   return { leads: inserted, callTasks, found: dispensaries.length };
@@ -1614,8 +1596,7 @@ async function upsertRelayLead(variant: string, asset: Asset, rdap: { registrar?
     ? `https://www.godaddy.com/whois/results.aspx?domain=${variant}&action=contactDomainOwner`
     : `https://who.is/whois/${variant}`;
   const heldSince = rdap.registeredOn ? new Date(rdap.registeredOn).getFullYear() : null;
-  const storefront = config.baseUrl.includes('localhost') ? '' : ` Details or direct offers: ${config.baseUrl}/buy/${asset.domain}.`;
-  const message = `Subject: ${asset.domain} — offering it to you first\n\nHi — I own ${asset.domain}. I noticed you've held ${variant}${heldSince ? ` since ${heldSince}` : ''}, so I wanted to offer you the matching domain before I sell it elsewhere. It's listed at $${asset.asking_price.toLocaleString()}.${storefront} If it's not for you, no worries.\n\n${config.fromName}`;
+  const message = `Subject: ${asset.domain} — offering it to you first\n\nHi — I own ${asset.domain}. I noticed you've held ${variant}${heldSince ? ` since ${heldSince}` : ''}, so I wanted to offer you the matching domain before I sell it elsewhere. It's listed at $${asset.asking_price.toLocaleString()}. If you'd like it or want to talk numbers, just reply here. If it's not for you, no worries.\n\n${config.fromName}`;
 
   const rows = await sql`
     INSERT INTO relay_leads (variant_domain, target_domain, registrar, registered_on, expires_on, is_live, relay_url, suggested_message)
