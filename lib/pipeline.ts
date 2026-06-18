@@ -3290,6 +3290,71 @@ export async function getVariantPerformance() {
   }));
 }
 
+// ── SOCIAL WTB: LLM PORTFOLIO MATCHER ─────────────────────────────────────────
+// Open naming requests ("what should I name my fintech app?") never contain a
+// specific domain's keyword, so strict keyword matching yields ~0. Instead, hand a
+// batch of naming-intent posts + a compact portfolio reference to Claude and let it
+// semantically match each to the best-fit domain (or none) — like a real broker.
+type SocialPost = { text: string; url: string; handle?: string | null; channel: string };
+
+let _portfolioRefCache: { at: number; ref: string } | null = null;
+async function portfolioMatchRef(): Promise<string> {
+  if (_portfolioRefCache && Date.now() - _portfolioRefCache.at < 600000) return _portfolioRefCache.ref;
+  const portfolio = loadPortfolio();
+  const lines: string[] = [];
+  for (const a of portfolio) {
+    const an = await getDomainAnalysis(a.domain);
+    const tags = an ? [...an.industries, ...an.use_cases].slice(0, 4).join(', ') : a.category;
+    lines.push(`${a.domain} — ${tags}`);
+  }
+  const ref = lines.join('\n');
+  _portfolioRefCache = { at: Date.now(), ref };
+  return ref;
+}
+
+async function llmMatchSocialPosts(posts: SocialPost[]): Promise<number> {
+  if (!posts.length) return 0;
+  const batch = posts.slice(0, 40);
+  const ref = await portfolioMatchRef();
+  const list = batch.map((p, i) => `${i + 1}. ${p.text.replace(/\s+/g, ' ').slice(0, 220)}`).join('\n');
+  let matches: { post: number; domain: string; why: string }[] = [];
+  try {
+    const res = await client.messages.create({
+      model: config.model, max_tokens: 1024,
+      messages: [{ role: 'user', content: `These are social posts. Below them is a list of domains for sale.
+
+For EACH post, match it to ONE domain ONLY IF ALL of these hold:
+1. The author is a REAL founder/operator actively naming or rebranding a REAL business, product, or project that needs a domain right now.
+2. One of the domains is a genuinely strong fit for what they're building — a match a sharp broker would actually pitch.
+
+REJECT (return no match) for: jokes, memes, emotional/hypothetical/sarcastic posts, fans/stans, song lyrics, people naming pets/babies/cars-for-fun, vague musings, anyone not seriously buying a domain. When in doubt, reject. Most posts get NO match.
+
+POSTS:
+${list}
+
+DOMAINS FOR SALE:
+${ref}
+
+Return ONLY a JSON array, one object per genuinely-qualified match (skip everything else): [{"post": <number>, "domain": "exact domain from the list", "why": "short reason"}]. Return [] if nothing qualifies.` }],
+    });
+    const text = res.content[0].type === 'text' ? res.content[0].text : '[]';
+    matches = JSON.parse(text.replace(/```json\n?|\n?```/g, '').trim());
+  } catch { return 0; }
+
+  const valid = new Set(loadPortfolio().map(a => a.domain));
+  let created = 0;
+  for (const m of matches) {
+    const p = batch[m.post - 1];
+    if (!p || !valid.has(m.domain)) continue;
+    const rows = await sql`
+      INSERT INTO dm_tasks (channel, url, handle, title, target_domain)
+      VALUES (${p.channel}, ${p.url}, ${p.handle ?? null}, ${p.text.slice(0, 200)}, ${m.domain})
+      ON CONFLICT (url) DO NOTHING RETURNING id`;
+    if (rows.length) created++;
+  }
+  return created;
+}
+
 // ── REDDIT WTB ────────────────────────────────────────────────────────────────
 // People publicly posting "want to buy a domain" — highest free intent there is.
 // Uses the existing Reddit JSON scraper with keywords from the domain analyses.
@@ -3319,25 +3384,13 @@ export async function redditWtbLeads(targetDomains?: string[]): Promise<{ insert
   let via = 'direct';
   let error = direct.error;
   if (!leads.length && direct.error?.includes('403') && config.apifyApiKey) {
-    // Only the domain's own niche words signal relevance — drop generic domain jargon
-    // so "looking for a non-alcoholic beer domain" doesn't surface for indikaclub.com.
-    const generic = new Set(['domain', 'domains', 'name', 'names', 'brand', 'brands', 'website', 'online', 'business', 'company', 'premium', 'digital']);
-    const relevantKws = [...kwSet].filter(w => w.length > 3 && !generic.has(w));
-    const serp = await discoverRedditWtbViaGoogle(relevantKws);
+    const serp = await discoverRedditWtbViaGoogle(); // no keyword pre-filter — the LLM matcher does relevance
     dmPosts = serp.dmPosts;
     via = 'google-serp';
     error = serp.error;
   }
 
-  const targetLabel = portfolio.map(a => a.domain).join(', ');
-  let dmTasks = 0;
-  for (const p of dmPosts) {
-    const rows = await sql`
-      INSERT INTO dm_tasks (channel, url, handle, title, target_domain)
-      VALUES ('reddit', ${p.url}, ${null}, ${p.title}, ${targetLabel})
-      ON CONFLICT (url) DO NOTHING RETURNING id`;
-    if (rows.length) dmTasks++;
-  }
+  const dmTasks = await llmMatchSocialPosts(dmPosts.map(p => ({ text: p.title, url: p.url, channel: 'reddit' })));
 
   const { inserted, skipped } = await upsertLeads(leads);
   return { inserted, skipped, found: leads.length, dmTasks, via, error };
@@ -3403,26 +3456,7 @@ async function discoverRedditWtbViaGoogle(relevantKws: string[] = []): Promise<{
 // DM task tagged with whichever domains fit, so it scales with inventory.
 type HnHit = { objectID: string; title?: string; url?: string | null; author?: string; story_text?: string | null; comment_text?: string | null };
 
-export async function hackerNewsWtbLeads(targetDomains?: string[]): Promise<{ found: number; dmTasks: number; matched: number; error?: string }> {
-  const portfolio = loadPortfolio(targetDomains);
-  const generic = new Set(['domain', 'domains', 'name', 'names', 'brand', 'brands', 'website', 'online', 'business', 'company', 'premium', 'digital', 'startup', 'startups', 'product']);
-  const domainKws: { domain: string; kws: string[] }[] = [];
-  for (const asset of portfolio) {
-    const base = asset.domain.split('.')[0].toLowerCase();
-    const kw = new Set<string>([base]);
-    const suffix = base.match(/(club|app|hub|lab|shop|store)$/i)?.[1];
-    if (suffix) { kw.add(suffix); kw.add(base.slice(0, -suffix.length)); }
-    const analysis = await getDomainAnalysis(asset.domain);
-    if (analysis) {
-      [...analysis.industries, ...analysis.use_cases]
-        .flatMap(s => s.toLowerCase().split(/[\s,/&]+/))
-        .filter(w => w.length > 3)
-        .slice(0, 20)
-        .forEach(w => kw.add(w));
-    }
-    domainKws.push({ domain: asset.domain, kws: [...kw].filter(w => w.length > 3 && !generic.has(w)) });
-  }
-
+export async function hackerNewsWtbLeads(_targetDomains?: string[]): Promise<{ found: number; dmTasks: number; matched: number; error?: string }> {
   const since = Math.floor(Date.now() / 1000) - 21 * 86400;
   // Active seeking only — passive mentions ("domain name", "brand name") match
   // meta-discussion about domains, not people who actually want one.
@@ -3443,27 +3477,16 @@ export async function hackerNewsWtbLeads(targetDomains?: string[]): Promise<{ fo
     return { found: 0, dmTasks: 0, matched: 0, error: (e as Error).message };
   }
 
-  let dmTasks = 0;
-  let matched = 0;
+  const candidates: SocialPost[] = [];
   for (const h of hits.values()) {
     const title = (h.title ?? '').replace(/<[^>]+>/g, ' ');
-    // Show/Launch HN are finished products, not someone seeking a name — skip them
-    if (/^\s*(show|launch)\s+hn/i.test(title)) continue;
-    const text = `${title} ${h.story_text ?? ''} ${h.comment_text ?? ''}`.replace(/<[^>]+>/g, ' ');
+    if (/^\s*(show|launch)\s+hn/i.test(title)) continue; // finished products, not seekers
+    const text = `${title} ${h.story_text ?? ''}`.replace(/<[^>]+>/g, ' ').trim();
     if (!intentRe.test(text)) continue;
-    // Relevance matches the TITLE only — the body is too noisy and yields false hits
-    const lcTitle = title.toLowerCase();
-    const fit = domainKws.filter(d => d.kws.some(kw => lcTitle.includes(kw))).map(d => d.domain);
-    if (!fit.length) continue;
-    matched++;
-    const url = `https://news.ycombinator.com/item?id=${h.objectID}`;
-    const rows = await sql`
-      INSERT INTO dm_tasks (channel, url, handle, title, target_domain)
-      VALUES ('hn', ${url}, ${h.author ?? null}, ${(h.title ?? 'HN post').slice(0, 200)}, ${fit.join(', ')})
-      ON CONFLICT (url) DO NOTHING RETURNING id`;
-    if (rows.length) dmTasks++;
+    candidates.push({ text, url: `https://news.ycombinator.com/item?id=${h.objectID}`, handle: h.author, channel: 'hn' });
   }
-  return { found: hits.size, dmTasks, matched };
+  const dmTasks = await llmMatchSocialPosts(candidates);
+  return { found: hits.size, dmTasks, matched: dmTasks };
 }
 
 // ── X / TWITTER WTB ───────────────────────────────────────────────────────────
@@ -3472,26 +3495,10 @@ export async function hackerNewsWtbLeads(targetDomains?: string[]): Promise<{ fo
 // portfolio's niche and surfaced as manual DM tasks, same as Reddit/HN.
 type XTweet = { url?: string; twitterUrl?: string; text?: string; createdAt?: string; author?: { userName?: string } };
 
-export async function xWtbLeads(targetDomains?: string[]): Promise<{ found: number; dmTasks: number; matched: number; error?: string }> {
+export async function xWtbLeads(_targetDomains?: string[]): Promise<{ found: number; dmTasks: number; matched: number; error?: string }> {
   if (!config.apifyApiKey) return { found: 0, dmTasks: 0, matched: 0, error: 'no apify key' };
-  const portfolio = loadPortfolio(targetDomains);
-  const generic = new Set(['domain', 'domains', 'name', 'names', 'brand', 'brands', 'website', 'online', 'business', 'company', 'premium', 'digital', 'startup', 'startups', 'product']);
-  const domainKws: { domain: string; kws: string[] }[] = [];
-  for (const asset of portfolio) {
-    const base = asset.domain.split('.')[0].toLowerCase();
-    const kw = new Set<string>([base]);
-    const suffix = base.match(/(club|app|hub|lab|shop|store)$/i)?.[1];
-    if (suffix) { kw.add(suffix); kw.add(base.slice(0, -suffix.length)); }
-    const analysis = await getDomainAnalysis(asset.domain);
-    if (analysis) {
-      [...analysis.industries, ...analysis.use_cases]
-        .flatMap(s => s.toLowerCase().split(/[\s,/&]+/))
-        .filter(w => w.length > 3).slice(0, 20).forEach(w => kw.add(w));
-    }
-    domainKws.push({ domain: asset.domain, kws: [...kw].filter(w => w.length > 3 && !generic.has(w)) });
-  }
 
-  // Niche-scoped search terms with a since: operator so X only returns recent tweets
+  // Naming-intent search terms with a since: operator so X only returns recent tweets
   // (raw search otherwise dredges up years-old posts). Intent + relevance gates below.
   const since = new Date(Date.now() - 120 * 86400000).toISOString().slice(0, 10);
   // Portfolio-agnostic naming-intent queries — the relevance gate below matches hits
@@ -3508,28 +3515,22 @@ export async function xWtbLeads(targetDomains?: string[]): Promise<{ found: numb
     tweets = (res.data as XTweet[]).filter(t => t && t.text);
   } catch (e) { return { found: 0, dmTasks: 0, matched: 0, error: (e as Error).message }; }
 
-  // First-person seeking only — bare "rebranding" matched news headlines and jokes.
-  const intentRe = /\b(looking for a (domain|name)|need a (domain|name) for (my|our)|what (should i|to) (call|name)|name for (my|our) (brand|company|dispensary|shop|line|startup|cbd|cannabis)|help me name (my|our)|suggest(ions)? for a (name|domain)|naming (my|our) (brand|company|dispensary|shop|line|startup))\b/i;
+  // First-person seeking only — niche-agnostic; the LLM matcher does relevance.
+  const intentRe = /\b(looking for a (domain|name)|need a (domain|name)|what (should i|to) (call|name)|name for (my|our) (brand|company|startup|app|product|business|store|shop|tool|project)|help me name (my|our)|suggest(ions)? for a (name|domain)|naming (my|our) (brand|company|startup|app|product|business))\b/i;
   const cutoff = Date.now() - 130 * 86400000;
   const seen = new Set<string>();
-  let matched = 0; let dmTasks = 0;
+  const candidates: SocialPost[] = [];
   for (const tw of tweets) {
     const text = (tw.text ?? '').replace(/\s+/g, ' ');
     const url = tw.url ?? tw.twitterUrl;
     if (!url || seen.has(url) || /^rt @/i.test(text) || !intentRe.test(text)) continue;
     const ts = tw.createdAt ? Date.parse(tw.createdAt) : NaN;
     if (!Number.isNaN(ts) && ts < cutoff) continue; // recency backstop
-    const lc = text.toLowerCase();
-    const fit = domainKws.filter(d => d.kws.some(kw => lc.includes(kw))).map(d => d.domain);
-    if (!fit.length) continue;
-    seen.add(url); matched++;
-    const rows = await sql`
-      INSERT INTO dm_tasks (channel, url, handle, title, target_domain)
-      VALUES ('x', ${url}, ${tw.author?.userName ?? null}, ${text.slice(0, 200)}, ${fit.join(', ')})
-      ON CONFLICT (url) DO NOTHING RETURNING id`;
-    if (rows.length) dmTasks++;
+    seen.add(url);
+    candidates.push({ text, url, handle: tw.author?.userName ?? null, channel: 'x' });
   }
-  return { found: tweets.length, dmTasks, matched };
+  const dmTasks = await llmMatchSocialPosts(candidates);
+  return { found: tweets.length, dmTasks, matched: dmTasks };
 }
 
 // ── DAILY INGEST CHAIN ────────────────────────────────────────────────────────
