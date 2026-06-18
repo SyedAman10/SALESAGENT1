@@ -2151,9 +2151,8 @@ Domain:
     ? `\nTRIGGER MOMENT: ${rawData.trigger_company} just hit a buying moment — ${rawData.trigger}. Open by referencing that event specifically (congratulate briefly, no flattery), then connect the domain to what they're building NOW. This is why you're emailing TODAY and not last month — make that obvious.`
     : '';
 
-  const storefrontLine = config.baseUrl.includes('localhost')
-    ? ''
-    : `\nStorefront link (include it naturally — they can see details, chat, or buy instantly there): ${config.baseUrl}/buy/${match.domain}`;
+  // No links in cold emails — a bare app URL reads as phishing and tanks trust/deliverability.
+  const storefrontLine = '\nCTA: ask them to simply reply if interested. Do NOT include any link, URL, or web address anywhere in the email.';
 
   return `Write a cold domain sales email. Sound like a real person, not a template.
 
@@ -3045,7 +3044,7 @@ async function dispatchEmail(email: SendItem, lead: { name: string; email: strin
   }
   const body = isClosing
     ? email.body
-    : `${email.body}\n\n---\nTo unsubscribe: ${config.baseUrl}/api/unsubscribe?email=${encodeURIComponent(lead.email)}`;
+    : `${email.body}\n\n---\nNot interested? Just reply "no thanks" and I won't follow up.`;
 
   const { from } = await sendViaGmail({ to: lead.email, subject: email.subject, body, threadId, inReplyTo, from: fromAccount });
   await sql`UPDATE emails SET status = 'sent', sent_at = NOW() WHERE id = ${email.id}`;
