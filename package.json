@@ -11,6 +11,8 @@
   "dependencies": {
     "@anthropic-ai/sdk": "^0.96.0",
     "@neondatabase/serverless": "^0.10.4",
+    "@types/adm-zip": "^0.5.8",
+    "adm-zip": "^0.5.17",
     "axios": "^1.16.1",
     "cheerio": "^1.2.0",
     "csv-parse": "^6.2.1",
