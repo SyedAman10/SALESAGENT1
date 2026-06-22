@@ -2145,15 +2145,12 @@ Domain:
 Recipient: ${lead.name}${lead.company ? ` @ ${lead.company}` : ''}
 Buyer signals: ${enrichment.key_signals.join('; ')}
 Domain fit: ${match.domain} — ${match.relevance_reasoning}${domainInsights}${companySnippet}${upgradeContext}${storefrontLine}
-Price placeholder: [PRICE]
-
 Style: ${variantInstructions[variant as keyof typeof variantInstructions]}
 
 Structure (research-backed — follow exactly):
 1. First line: a specific observation about THEIR business that proves research (from the company snippet/signals). Never open with the domain or "I".
-2. Bridge: why this domain fits what THEY are building — buyer-centric, not domain-centric. One comp sale max as a price anchor.
-3. Price, stated plainly.
-4. One low-commitment, concrete CTA (e.g. "worth a couple of minutes this week?" / "want me to hold it while you check with your team?") — never a bare "interested?" or "would this be a fit?".
+2. Bridge: why this domain fits what THEY are building — buyer-centric, not domain-centric. One comp sale max as a credibility anchor.
+3. One low-commitment, concrete CTA (e.g. "worth a couple of minutes this week?" / "want me to hold it while you check with your team?") — never a bare "interested?" or "would this be a fit?". Do NOT include any price.
 
 Rules (strict):
 - 50–90 words total. One ask only.
