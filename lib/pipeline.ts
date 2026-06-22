@@ -1,5 +1,6 @@
 import Anthropic from '@anthropic-ai/sdk';
 import axios from 'axios';
+import AdmZip from 'adm-zip';
 import * as cheerio from 'cheerio';
 import { sendViaGmail, fetchRecentInboundEmails, getSendCapacityToday } from './gmail';
 import { getEffectiveDailyLimit } from './warmup';
@@ -69,12 +70,14 @@ Use cases: ${analysis.use_cases.join(', ')}
 
 Generate 5 distinct, specific Apollo search queries. Each should target a DIFFERENT buyer profile.
 Target people who would BUILD their business on this domain — NOT domain investors or brokers.
-Focus on: founders, C-suite, brand/marketing leaders in the relevant industries.
+Focus on people who would DECIDE to buy a domain name — that is primarily marketing/brand decision-makers and founders at small companies.
+Priority roles: CMO, Marketing Director, VP Marketing, Head of Brand, Brand Manager, Founder, CEO.
+De-prioritise: generic C-suite at large enterprises, technical roles (CTO, engineer), finance roles (CFO).
 
 Apollo seniority values (use only these): owner, founder, c_suite, partner, vp, head, director, manager, senior
 
 Return JSON array only:
-[{"titles": ["Founder", "CEO"], "keywords": "specific niche keyword phrase", "seniority": ["founder", "c_suite"]}]
+[{"titles": ["CMO", "Marketing Director", "VP Marketing", "Head of Brand"], "keywords": "specific niche keyword phrase", "seniority": ["vp", "head", "director"]}]
 Return valid JSON only.`,
       }],
     });
@@ -137,7 +140,7 @@ async function fetchDomainSpecificLeads(asset: Asset, analysis: DomainAnalysis):
       const res = await axios.post(
         'https://api.apollo.io/api/v1/mixed_people/api_search',
         {
-          person_titles: ['Founder', 'Co-Founder', 'Owner', 'CEO', 'President'],
+          person_titles: ['Founder', 'Co-Founder', 'Owner', 'CEO', 'President', 'CMO', 'Marketing Director', 'VP Marketing', 'Head of Brand', 'Head of Marketing'],
           q_keywords: buyerType,
           organization_num_employees_ranges: ['1,10', '11,50'],
           per_page: 20,
@@ -892,7 +895,7 @@ async function apolloBrokerSearch(): Promise<{ leads: RawLead[]; error?: string 
       try {
         const res = await axios.post(
           'https://api.apollo.io/api/v1/mixed_people/api_search',
-          { person_titles: titles, person_seniority: ['owner', 'founder', 'c_suite', 'partner', 'vp'], per_page: 25, page },
+          { person_titles: titles, person_seniority: ['owner', 'founder', 'c_suite', 'partner', 'vp', 'head', 'director'], per_page: 25, page },
           { headers: { 'Content-Type': 'application/json', 'X-Api-Key': config.apolloApiKey } }
         );
         const people: ApolloPersonResult[] = res.data?.people ?? [];
@@ -940,7 +943,7 @@ async function apolloBrandKeywordSearch(portfolio: Asset[]): Promise<{ leads: Ra
       try {
         const res = await axios.post(
           'https://api.apollo.io/api/v1/mixed_people/api_search',
-          { q_keywords: kw, person_seniority: ['owner', 'founder', 'c_suite'], per_page: 20, page: 1 },
+          { q_keywords: kw, person_seniority: ['owner', 'founder', 'c_suite', 'vp', 'head', 'director'], per_page: 20, page: 1 },
           { headers: { 'Content-Type': 'application/json', 'X-Api-Key': config.apolloApiKey } }
         );
         const people: ApolloPersonResult[] = res.data?.people ?? [];
@@ -1804,8 +1807,8 @@ export interface LeadEnrichment {
 
 export async function enrichLeads(limit?: number): Promise<{ enriched: number; skipped: number; failed: number }> {
   const leads = (limit
-    ? await sql`SELECT id, name, email, company, raw_data FROM leads WHERE enrichment IS NULL AND status = 'new' ORDER BY score DESC NULLS LAST, id LIMIT ${limit}`
-    : await sql`SELECT id, name, email, company, raw_data FROM leads WHERE enrichment IS NULL AND status = 'new'`) as LeadRow[];
+    ? await sql`SELECT id, name, email, company, raw_data FROM leads WHERE (status = 'new' OR (status = 'skipped' AND score IS NULL)) ORDER BY score DESC NULLS LAST, id LIMIT ${limit}`
+    : await sql`SELECT id, name, email, company, raw_data FROM leads WHERE (status = 'new' OR (status = 'skipped' AND score IS NULL))`) as LeadRow[];
 
   let enriched = 0; let skipped = 0; let failed = 0;
   const BATCH = 5;
@@ -1828,8 +1831,9 @@ export async function enrichLeads(limit?: number): Promise<{ enriched: number; s
     for (const r of results) {
       if (r.status === 'fulfilled') {
         const { lead, result } = r.value;
-        const status = result.score >= config.leadScoreThreshold ? 'enriched' : 'skipped';
-        await sql`UPDATE leads SET enrichment = ${JSON.stringify(result)}, score = ${result.score}, status = ${status} WHERE id = ${lead.id}`;
+        const score = typeof result.score === 'number' ? result.score : 0;
+        const status = score >= config.leadScoreThreshold ? 'enriched' : 'skipped';
+        await sql`UPDATE leads SET enrichment = ${JSON.stringify(result)}, score = ${score}, status = ${status} WHERE id = ${lead.id}`;
         status === 'enriched' ? enriched++ : skipped++;
       } else {
         failed++;
@@ -2017,7 +2021,7 @@ function matchPrompt(lead: { name: string; company?: string | null }, enrichment
     return `${i + 1}. ${d.domain} — $${d.asking_price.toLocaleString()} — ${d.category} — ${d.description}${buyerContext}`;
   }).join('\n');
 
-  return `You are matching domains from a portfolio to a potential buyer.
+  return `You are matching domains from a portfolio to a potential buyer. Only match domains the buyer has a genuine reason to want.
 
 Buyer: ${lead.name} at ${lead.company ?? 'unknown'}
 Focus: ${enrichment.domain_focus.join(', ')} | Budget: ${enrichment.budget_range}
@@ -2028,13 +2032,14 @@ Portfolio:
 ${domainLines}
 
 Rules:
-- If the buyer works at a domain brokerage, marketplace, or investment firm (e.g. MediaOptions, DomainAgents, Sedo, BrandBucket, Afternic), they buy domains to resell — match any quality brandable
+- Match ONLY if there is a clear, specific reason this buyer would want this domain: their industry aligns, their brand or company name matches a keyword, or they are actively building in that niche
+- Domain brokers/investors (e.g. MediaOptions, Sedo, BrandBucket) may buy to resell — match any quality brandable with a realistic buyer market
 - If budget is unknown, assume they can afford the price
-- Be inclusive rather than exclusive — a domain professional can always pass if it's not right for them
-- Only return [] if there is genuinely zero connection
+- A weak or speculative connection is NOT a match — return [] rather than send a mismatched email that burns sender reputation
+- Return at most 1 domain unless the buyer genuinely fits multiple
 
-Return JSON array (1-3 items or []):
-[{"domain": "exact domain name", "relevance_reasoning": "one sentence"}]
+Return JSON array (0-1 items, 2 max in rare multi-niche cases):
+[{"domain": "exact domain name", "relevance_reasoning": "one specific sentence on why this buyer would want it"}]
 Return valid JSON only.`;
 }
 
@@ -2178,7 +2183,7 @@ export async function writeFollowUps(): Promise<{ written: number }> {
   for (const lead of contacted) {
     const analysis = await getDomainAnalysis(lead.domain);
     const asset = portfolio.find(a => a.domain === lead.domain);
-    for (const day of [3, 5, 7]) {
+    for (const day of [3, 10, 17, 24]) {
       const existing = await sql`SELECT id FROM emails WHERE lead_id = ${lead.id} AND domain = ${lead.domain} AND sequence_day = ${day}`;
       if (existing.length) continue;
       try {
@@ -2210,15 +2215,16 @@ function followUpPrompt(
     ? ` The sale closes ${formatDeadline(deadline)} — state this plainly as a real deadline, best offer wins.`
     : '';
   const angles: Record<number, string> = {
-    3: `Brief casual check-in, 2-3 sentences. Mention you reached out a couple days ago. No hard sell.${deadlineNote}`,
-    5: `New angle — lead with a specific use case or value prop they may not have considered. 3-4 sentences.${deadlineNote}`,
-    7: `Final follow-up. Create gentle urgency — mention other parties have shown interest. Keep it short and warm.${deadlineNote}`,
+    3:  `Brief casual check-in, 2-3 sentences. Mention you reached out a few days ago. No hard sell.${deadlineNote}`,
+    10: `New angle — lead with a specific use case or value prop they may not have considered. 3-4 sentences. Remind them once of the domain and why it fits their business specifically.${deadlineNote}`,
+    17: `Gentle urgency — mention other parties have shown interest and you want to give them first right of refusal. Keep it short and warm.${deadlineNote}`,
+    24: `Closing the file. 2 sentences max. Tell them you're moving on but wanted to give them one final chance. Warm, no pressure, no hard sell — just a clean close.${deadlineNote}`,
   };
   const domainContext = analysis
-    ? `Domain: ${domain}\nOne-liner: ${analysis.one_liner}\nHook: ${analysis.email_hooks[day === 5 ? 1 : 0] ?? analysis.email_hooks[0]}`
+    ? `Domain: ${domain}\nOne-liner: ${analysis.one_liner}\nHook: ${analysis.email_hooks[day === 10 ? 1 : 0] ?? analysis.email_hooks[0]}`
     : `Domain: ${domain}`;
 
-  return `Write follow-up #${day === 3 ? 1 : day === 5 ? 2 : 3} in a domain sales sequence.
+  return `Write follow-up #${day === 3 ? 1 : day === 10 ? 2 : day === 17 ? 3 : 4} in a domain sales sequence.
 
 Buyer: ${lead.name} (${lead.company ?? 'unknown'})
 ${domainContext}
@@ -2234,6 +2240,68 @@ Rules: under 80 words, sign as ${config.fromName}, no spam trigger words, sounds
 
 Return JSON: {"subject": "...", "body": "..."}
 Return valid JSON only.`;
+}
+
+// ── BUYER QUALIFICATION ───────────────────────────────────────────────────────
+// When a non-closing-mode lead replies, send one qualification email before
+// jumping to price. Brokers qualify first (budget, timeline, use case) so they
+// know how to pitch the negotiation. Qualification email is held as 'pending'
+// and won't send until approved — keeps you in control of the conversation.
+
+export async function writeQualificationEmails(): Promise<{ written: number; skipped: number }> {
+  const portfolio = loadPortfolio();
+  const closingDomains = new Set(activeClosingAssets().map(a => a.domain));
+
+  // Leads that replied but haven't received a qualification or closing email yet
+  const repliedLeads = await sql`
+    SELECT DISTINCT l.id, l.name, l.email, l.company,
+      (SELECT e.domain FROM emails e WHERE e.lead_id = l.id AND e.status = 'sent' ORDER BY e.sent_at DESC LIMIT 1) as domain,
+      (SELECT r.snippet FROM replies r WHERE r.lead_id = l.id ORDER BY r.received_at DESC LIMIT 1) as reply_snippet
+    FROM leads l
+    WHERE l.status = 'replied'
+      AND NOT EXISTS (
+        SELECT 1 FROM emails e WHERE e.lead_id = l.id AND e.variant IN ('qualification', 'closing-reply', 'closing-negotiation')
+      )
+  ` as { id: number; name: string; email: string; company: string | null; domain: string | null; reply_snippet: string | null }[];
+
+  let written = 0; let skipped = 0;
+
+  for (const lead of repliedLeads) {
+    if (!lead.domain || closingDomains.has(lead.domain)) { skipped++; continue; }
+    const asset = portfolio.find(a => a.domain === lead.domain);
+    if (!asset) { skipped++; continue; }
+
+    try {
+      const res = await client.messages.create({
+        model: config.model, max_tokens: 350,
+        messages: [{ role: 'user', content: `Write a short qualification reply for a warm domain sales thread. They already replied to your cold email — now ask 2-3 quick questions to understand their intent before discussing price.
+
+Domain: ${lead.domain} (asking $${asset.asking_price.toLocaleString()})
+Buyer: ${lead.name}${lead.company ? ` @ ${lead.company}` : ''}
+Their reply: "${lead.reply_snippet ?? 'expressed interest'}"
+
+Questions to weave in naturally (pick the 2 most relevant):
+- What's your timeline for making a decision?
+- What will you be building on it / how do you plan to use it?
+- Is budget in the range of $${asset.asking_price.toLocaleString()} or would you need a payment plan?
+- Who else is involved in the decision?
+
+Rules: under 60 words, sounds like a real person replying, no hard sell, warm and curious tone, sign as ${config.fromName}
+Return JSON: {"subject": "Re: [their subject]", "body": "..."}
+Return valid JSON only.` }],
+      });
+      const text = res.content[0].type === 'text' ? res.content[0].text : '';
+      const parsed = JSON.parse(text.replace(/```json\n?|\n?```/g, '').trim()) as { subject: string; body: string };
+      await sql`INSERT INTO emails (lead_id, domain, subject, body, variant, status, sequence_day) VALUES (${lead.id}, ${lead.domain}, ${parsed.subject}, ${parsed.body}, 'qualification', 'pending', 1)`;
+      written++;
+      await alertOwner(
+        `[REPLY] ${lead.name} replied re: ${lead.domain} — qualification draft ready`,
+        `${lead.name}${lead.company ? ` @ ${lead.company}` : ''} replied:\n\n"${lead.reply_snippet ?? ''}"\n\nQualification email drafted (pending your approval before sending).\n\nApprove in dashboard: ${config.baseUrl}/`
+      );
+    } catch { skipped++; }
+    await sleep(300);
+  }
+  return { written, skipped };
 }
 
 // ── REPLIES ───────────────────────────────────────────────────────────────────
@@ -2329,7 +2397,7 @@ export async function markIgnoredOutcomes(): Promise<{ marked: number }> {
   const rows = await sql`
     SELECT DISTINCT l.id, l.company, l.raw_data, e.domain
     FROM leads l
-    INNER JOIN emails e ON e.lead_id = l.id AND e.status = 'sent' AND e.sequence_day >= 7
+    INNER JOIN emails e ON e.lead_id = l.id AND e.status = 'sent' AND e.sequence_day IN (7, 24)
     WHERE l.status = 'contacted'
       AND e.sent_at < NOW() - INTERVAL '2 days'
       AND NOT EXISTS (SELECT 1 FROM replies r WHERE r.lead_id = l.id)
@@ -2655,11 +2723,18 @@ function closingPrompt(
     ? `- It is TRUE that ${competingCount} interested parties are in active conversations about this domain — mention competing interest once, factually, to drive urgency.`
     : '- Do NOT claim other interest — there is only this one active conversation.';
 
+  const leaseMonthly = Math.ceil(asset.asking_price / 12);
+  const leaseRule = `- If they push back on price or seem hesitant about the full amount, offer a payment plan: "$${leaseMonthly.toLocaleString()}/month for 12 months" as an alternative. Frame it as flexibility, not a discount — the total is the same. Only offer this if price is clearly the blocker.`;
+
+  const concessionRule = asset.floor_price
+    ? `- Concession pattern (if they counter): first drop max 10% (to $${Math.round(asset.asking_price * 0.9).toLocaleString()}), second drop max 5% more, always require reciprocity ("I can do X if you can close by ${deadlineStr}"). Never reveal the floor price.`
+    : `- If they counter, make small declining concessions: first 10% max, then 5%, then stop. Always tie each concession to the deadline: "I can do X if you close by ${deadlineStr}."`;
+
   const instructions: Record<string, string> = {
-    'closing-reply': 'They replied with interest. Respond directly: confirm the asking price, state the deadline, ask if they want to move forward.',
-    'closing-negotiation': 'They likely mentioned a price or offer. Move the negotiation forward per the price rules below.',
+    'closing-reply': 'They replied with interest. Confirm the asking price, state the deadline plainly, ask if they want to move forward. Mention the payment plan option if their tone suggests budget sensitivity.',
+    'closing-negotiation': 'They mentioned a price or offer. Apply the concession pattern — make a modest counter tied to the deadline. Offer the payment plan if their offer is low but they seem genuinely interested.',
     'closing-nudge-24h': 'They replied earlier but went quiet for 24h+. One short nudge: 2 sentences max, reference the deadline, ask for their decision.',
-    'closing-nudge-48h': 'Second and final nudge after 48h+ of silence. Even shorter. Deadline is firm — last chance to make an offer.',
+    'closing-nudge-48h': 'Second and final nudge after 48h+ of silence. Even shorter. Deadline is firm — last chance.',
   };
 
   return `Write the next email in an active domain sale negotiation. This is a WARM thread — they already replied.
@@ -2675,6 +2750,8 @@ Task: ${instructions[variant] ?? instructions['closing-reply']}
 Rules (strict):
 ${floorRule}
 ${competingRule}
+${leaseRule}
+${concessionRule}
 - Under 60 words. Plain human tone — like a busy founder typing on their phone.
 - No "I hope this finds you well", no fluff, no exclamation marks, no AI-sounding phrasing.${config.baseUrl.includes('localhost') ? '' : `\n- They can make a binding offer or buy instantly at ${config.baseUrl}/buy/${asset.domain} — mention it when it helps close.`}
 - Subject: if replying to their message, reuse their subject with "Re:" — their subject was "${lastReply.subject}".
@@ -2690,6 +2767,72 @@ async function alertOwner(subject: string, body: string): Promise<void> {
   } catch (e) {
     console.error('[alertOwner]', (e as Error).message);
   }
+}
+
+// ── LINKEDIN FOLLOW-UPS ───────────────────────────────────────────────────────
+
+export async function writeLinkedInFollowUps(): Promise<{ written: number }> {
+  const portfolio = loadPortfolio();
+  const priceMap = new Map(portfolio.map(a => [a.domain, a.asking_price]));
+
+  type LinkedInCandidate = { lead_id: number; name: string; company: string | null; linkedin_url: string; domain: string; days_since_send: number };
+  const candidates = await sql`
+    SELECT DISTINCT ON (l.id) l.id as lead_id, l.name, l.company, l.linkedin_url, e.domain,
+      EXTRACT(DAY FROM NOW() - e.sent_at)::int as days_since_send
+    FROM leads l
+    INNER JOIN emails e ON e.lead_id = l.id AND e.status = 'sent' AND e.sequence_day = 1
+    LEFT JOIN replies r ON r.lead_id = l.id
+    LEFT JOIN dm_tasks dt ON dt.url = l.linkedin_url AND dt.channel = 'linkedin'
+    WHERE l.linkedin_url IS NOT NULL
+      AND l.status NOT IN ('unsubscribed', 'ignored', 'bounced')
+      AND e.sent_at < NOW() - INTERVAL '10 days'
+      AND r.id IS NULL
+      AND dt.id IS NULL
+      AND l.score BETWEEN 65 AND 88
+      AND l.enrichment IS NOT NULL
+      AND (l.enrichment::json->>'budget_tier') = 'mid'
+    ORDER BY l.id, e.sent_at DESC
+    LIMIT 15
+  ` as LinkedInCandidate[];
+
+  let written = 0;
+  for (const c of candidates) {
+    const price = priceMap.get(c.domain);
+    if (!price) continue;
+    const firstName = c.name.split(' ')[0];
+    try {
+      const res = await client.messages.create({
+        model: config.analyzeModel,
+        max_tokens: 200,
+        messages: [{
+          role: 'user',
+          content: `Write a LinkedIn DM to follow up on a cold domain sales email that got no reply after ${c.days_since_send} days.
+
+Lead: ${firstName}${c.company ? `, ${c.company}` : ''}
+Domain: ${c.domain} ($${price.toLocaleString()})
+
+Rules:
+- 3-4 sentences max
+- Start with their first name, no "Hi" or "Hello"
+- Reference the domain naturally — don't lead with the price
+- End with a simple easy question (not "are you interested?")
+- Conversational LinkedIn tone, not salesy
+- No subject line, no sign-off, just the message body
+
+Return the message text only.`,
+        }],
+      });
+      const message = res.content[0].type === 'text' ? res.content[0].text.trim() : '';
+      if (!message) continue;
+      await sql`
+        INSERT INTO dm_tasks (channel, url, title, target_domain, message)
+        VALUES ('linkedin', ${c.linkedin_url}, ${`${c.name}${c.company ? ` — ${c.company}` : ''}`}, ${c.domain}, ${message})
+        ON CONFLICT (url) DO NOTHING
+      `;
+      written++;
+    } catch { /* skip */ }
+  }
+  return { written };
 }
 
 // ── DAILY REPORT ──────────────────────────────────────────────────────────────
@@ -2743,7 +2886,21 @@ export async function generateDailyReport(): Promise<string> {
     }
   }
 
-  const dmTasks = await sql`SELECT channel, url, handle, title FROM dm_tasks WHERE status = 'pending' ORDER BY created_at DESC LIMIT 5` as { channel: string; url: string; handle: string | null; title: string | null }[];
+  const linkedInTasks = await sql`SELECT url, title, target_domain, message FROM dm_tasks WHERE status = 'pending' AND channel = 'linkedin' ORDER BY created_at ASC LIMIT 10` as { url: string; title: string | null; target_domain: string | null; message: string | null }[];
+  if (linkedInTasks.length) {
+    lines.push('');
+    lines.push(`LINKEDIN FOLLOW-UPS (${linkedInTasks.length} pending) — click profile, paste message, mark done:`);
+    for (const t of linkedInTasks) {
+      lines.push('');
+      lines.push(`${t.title ?? ''}${t.target_domain ? ` | ${t.target_domain}` : ''}`);
+      lines.push(`Profile: ${t.url}`);
+      lines.push(`Message to paste:`);
+      lines.push(`${t.message ?? ''}`);
+      lines.push(`Mark done: ${config.baseUrl.replace(/\/$/, '')}/api/task/done?dm=${encodeURIComponent(t.url)}`);
+    }
+  }
+
+  const dmTasks = await sql`SELECT channel, url, handle, title FROM dm_tasks WHERE status = 'pending' AND channel != 'linkedin' ORDER BY created_at DESC LIMIT 5` as { channel: string; url: string; handle: string | null; title: string | null }[];
   if (dmTasks.length) {
     lines.push('');
     lines.push(`DM TASKS — manual outreach (${dmTasks.length} pending):`);
@@ -2754,7 +2911,7 @@ export async function generateDailyReport(): Promise<string> {
   }
 
   type RelayRow = { variant_domain: string; target_domain: string; registered_on: string | null; is_live: boolean; relay_url: string; suggested_message: string };
-  const relays = await sql`SELECT variant_domain, target_domain, registered_on, is_live, relay_url, suggested_message FROM relay_leads WHERE status = 'pending' ORDER BY is_live DESC, created_at DESC LIMIT 5` as RelayRow[];
+  const relays = await sql`SELECT variant_domain, target_domain, registered_on, is_live, relay_url, suggested_message FROM relay_leads WHERE status = 'pending' ORDER BY is_live DESC, created_at ASC LIMIT 15` as RelayRow[];
   if (relays.length) {
     lines.push('');
     lines.push(`REGISTRANT RELAY LEADS — manual, ~60s each (${relays.length} pending):`);
@@ -2775,11 +2932,18 @@ export async function generateDailyReport(): Promise<string> {
   }
 
   const variants = await getVariantPerformance();
-  const withReplies = variants.filter(v => v.replied > 0);
-  if (withReplies.length) {
+  if (variants.length) {
     lines.push('');
-    lines.push('VARIANT PERFORMANCE (variants with replies):');
-    for (const v of withReplies) lines.push(`- ${v.variant} on ${v.domain}: ${v.replied}/${v.sent} replied (${v.reply_rate})`);
+    lines.push('VARIANT PERFORMANCE (all sent):');
+    // Group by domain so it's easy to scan
+    const byDomain = new Map<string, typeof variants>();
+    for (const v of variants) { const g = byDomain.get(v.domain) ?? []; g.push(v); byDomain.set(v.domain, g); }
+    for (const [domain, dvariants] of byDomain) {
+      const totalSent = dvariants.reduce((s, v) => s + v.sent, 0);
+      const totalReplied = dvariants.reduce((s, v) => s + v.replied, 0);
+      lines.push(`${domain} (${totalSent} sent, ${totalReplied} replied):`);
+      for (const v of dvariants) lines.push(`  - ${v.variant}: ${v.replied}/${v.sent} replied (${v.reply_rate})`);
+    }
   }
 
   const offers = await sql`SELECT domain, name, email, amount, status, created_at FROM storefront_offers WHERE created_at > NOW() - INTERVAL '24 hours' ORDER BY created_at DESC` as { domain: string; name: string | null; email: string; amount: number; status: string; created_at: string }[];
@@ -2910,6 +3074,9 @@ export async function runLeadBatch(limit = 25): Promise<{ enriched: number; skip
 
 async function pickVariant(enrichment: LeadEnrichment, variants: { id: number; subject: string; body: string; variant: string }[]) {
   if (variants.length === 1) return variants[0];
+  // curious consistently outperforms (5.4% vs <2.5% for others) — prefer it by default
+  const curious = variants.find(v => v.variant === 'curious');
+  if (curious) return curious;
   try {
     const res = await client.messages.create({
       model: config.model, max_tokens: 8,
@@ -2964,12 +3131,28 @@ async function buildSendQueue(): Promise<SendItem[]> {
     ORDER BY l.tier ASC, l.score DESC NULLS LAST
   ` as SendItem[];
 
-  const day1 = await sql`
-    SELECT e.id, e.lead_id, e.domain, e.subject, e.body, e.sequence_day, e.variant
+  const day1Raw = await sql`
+    SELECT e.id, e.lead_id, e.domain, e.subject, e.body, e.sequence_day, e.variant, l.email as lead_email, l.score as lead_score
     FROM emails e INNER JOIN leads l ON l.id = e.lead_id
     WHERE e.status = 'approved' AND e.sequence_day = 1 AND e.variant NOT IN ('warmfirst') AND e.variant NOT LIKE 'closing%' AND l.status = 'enriched'
     ORDER BY l.tier ASC, l.score DESC
-  ` as SendItem[];
+  ` as (SendItem & { lead_email: string; lead_score: number })[];
+
+  // Same email address should only get one domain pitch per 30-day window — sending
+  // multiple pitches to the same person burns the relationship and sender reputation.
+  const recentlyContacted = new Set<string>(
+    ((await sql`
+      SELECT DISTINCT l.email FROM leads l INNER JOIN emails e ON e.lead_id = l.id
+      WHERE e.status = 'sent' AND e.sequence_day = 1 AND e.sent_at > NOW() - INTERVAL '30 days'
+    ` as { email: string }[])).map(r => r.email)
+  );
+  const seenEmail = new Set<string>();
+  const day1 = day1Raw.filter(e => {
+    if (recentlyContacted.has(e.lead_email)) return false;
+    if (seenEmail.has(e.lead_email)) return false;
+    seenEmail.add(e.lead_email);
+    return true;
+  }) as SendItem[];
 
   type FollowUpRow = SendItem & { day1_sent: Date | string | null };
   const dueFollowUpsAll = await sql`
@@ -3531,6 +3714,80 @@ export async function xWtbLeads(_targetDomains?: string[]): Promise<{ found: num
   }
   const dmTasks = await llmMatchSocialPosts(candidates);
   return { found: tweets.length, dmTasks, matched: dmTasks };
+}
+
+// ── NEWLY-REGISTERED DOMAIN UPGRADE BUYERS ────────────────────────────────────
+// Someone who registered a niche domain YESTERDAY is building a brand right now —
+// the earliest, highest-intent upgrade buyer. Free whoisds NRD feed → filter to the
+// portfolio's niches → LLM-match each to the best-fit domain → relay-form task
+// (registrant WHOIS is redacted — proven 0% — so reach them via the registrar form).
+export async function newlyRegisteredLeads(): Promise<{ scanned: number; niche: number; matched: number; relayLeads: number; error?: string }> {
+  const day = new Date(Date.now() - 2 * 86400000).toISOString().slice(0, 10); // feed lags ~1-2 days
+  const url = `https://www.whoisds.com/whois-database/newly-registered-domains/${Buffer.from(`${day}.zip`).toString('base64')}/nrd`;
+  let domains: string[] = [];
+  try {
+    const r = await axios.get(url, { responseType: 'arraybuffer', timeout: 30000, maxContentLength: 50_000_000 });
+    const zip = new AdmZip(Buffer.from(r.data as ArrayBuffer));
+    domains = zip.getEntries()[0].getData().toString('utf-8').split('\n').map(s => s.trim().toLowerCase()).filter(Boolean);
+  } catch (e) { return { scanned: 0, niche: 0, matched: 0, relayLeads: 0, error: (e as Error).message }; }
+
+  // Distinctive niche keywords from the portfolio DOMAIN NAMES only — analysis
+  // industries are too generic (they matched ~20% of all new registrations). Strong
+  // common-word stoplist + a few critical short niche terms.
+  const portfolio = loadPortfolio();
+  const generic = new Set(['online', 'store', 'shop', 'best', 'world', 'house', 'home', 'group', 'team', 'club', 'live', 'life', 'love', 'care', 'health', 'plus', 'site', 'tech', 'data', 'cloud', 'media', 'digital', 'global', 'first', 'prime', 'elite', 'official', 'company', 'business', 'services', 'solutions', 'market', 'trade', 'deal', 'sale', 'free', 'smart', 'easy', 'fast', 'good', 'great', 'time', 'work', 'play', 'game', 'news', 'blog', 'info', 'help', 'guide', 'book', 'page', 'link', 'tree', 'room', 'song', 'noir', 'flow', 'core', 'star', 'land', 'city', 'zone', 'spot', 'premium', 'brand', 'domain', 'website', 'studio', 'agency', 'group', 'never', 'ending', 'rider', 'riders', 'savage', 'poor', 'mansion', 'docs', 'solutions']);
+  const kw = new Set<string>(['cbd', 'hemp', 'thc', 'weed', 'cannabis']);
+  for (const a of portfolio) {
+    for (const w of a.domain.split('.')[0].toLowerCase().match(/[a-z]{5,}/g) ?? []) if (!generic.has(w)) kw.add(w);
+  }
+  const kws = [...kw];
+  const nicheMatches = domains.filter(dm => { const core = dm.split('.')[0]; return kws.some(k => core.includes(k)); });
+  if (!nicheMatches.length) return { scanned: domains.length, niche: 0, matched: 0, relayLeads: 0 };
+
+  // LLM: which for-sale domain would each new registrant want as a cleaner upgrade?
+  const batch = nicheMatches.slice(0, 60);
+  const ref = await portfolioMatchRef();
+  const list = batch.map((d, i) => `${i + 1}. ${d}`).join('\n');
+  let matches: { reg: number; domain: string }[] = [];
+  try {
+    const res = await client.messages.create({
+      model: config.model, max_tokens: 1024,
+      messages: [{ role: 'user', content: `Each line is a domain someone JUST registered (they're building a brand). Below is a list of domains FOR SALE.
+
+For each newly-registered domain, pick the ONE for-sale domain its owner would most plausibly want as a cleaner/better brand (same concept on a real .com), ONLY if it's a genuinely strong fit a broker would pitch. Most will have no good fit — skip those.
+
+NEWLY REGISTERED:
+${list}
+
+FOR SALE:
+${ref}
+
+Return ONLY a JSON array: [{"reg": <number>, "domain": "exact for-sale domain"}]. Skip non-matches. [] if none.` }],
+    });
+    const text = res.content[0].type === 'text' ? res.content[0].text : '[]';
+    matches = JSON.parse(text.replace(/```json\n?|\n?```/g, '').trim());
+  } catch { return { scanned: domains.length, niche: nicheMatches.length, matched: 0, relayLeads: 0 }; }
+
+  const priceMap = new Map(portfolio.map(a => [a.domain, a.asking_price]));
+  const valid = new Set(portfolio.map(a => a.domain));
+  let relayLeads = 0;
+  for (const m of matches) {
+    const reg = batch[m.reg - 1];
+    if (!reg || !valid.has(m.domain)) continue;
+    const rdap: { registered: boolean; registrar?: string; registeredOn?: string; expiresOn?: string } = await rdapLookup(reg).catch(() => ({ registered: false }));
+    const relayUrl = rdap.registrar?.toLowerCase().includes('godaddy')
+      ? `https://www.godaddy.com/whois/results.aspx?domain=${reg}&action=contactDomainOwner`
+      : `https://who.is/whois/${reg}`;
+    const price = priceMap.get(m.domain) ?? 0;
+    const message = `Subject: ${m.domain} — saw you just launched ${reg}\n\nHi — I noticed you just registered ${reg}. I own ${m.domain}, a premium matching .com — if you want a cleaner brand for what you're building, it's available at $${price.toLocaleString()}. Just reply if you'd like it. No worries if not.\n\n${config.fromName}`;
+    const rows = await sql`
+      INSERT INTO relay_leads (variant_domain, target_domain, registrar, registered_on, expires_on, is_live, relay_url, suggested_message)
+      VALUES (${reg}, ${m.domain}, ${rdap.registrar ?? null}, ${rdap.registeredOn ?? null}, ${rdap.expiresOn ?? null}, ${false}, ${relayUrl}, ${message})
+      ON CONFLICT (variant_domain) DO NOTHING RETURNING id`;
+    if (rows.length) relayLeads++;
+    await sleep(300);
+  }
+  return { scanned: domains.length, niche: nicheMatches.length, matched: matches.length, relayLeads };
 }
 
 // ── DAILY INGEST CHAIN ────────────────────────────────────────────────────────

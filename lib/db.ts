@@ -105,9 +105,11 @@ export async function initDb(): Promise<void> {
     handle TEXT,
     title TEXT,
     target_domain TEXT,
+    message TEXT,
     status TEXT NOT NULL DEFAULT 'pending',
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
   )`;
+  await db`ALTER TABLE dm_tasks ADD COLUMN IF NOT EXISTS message TEXT`;
   await db`CREATE TABLE IF NOT EXISTS relay_leads (
     id SERIAL PRIMARY KEY,
     variant_domain TEXT NOT NULL UNIQUE,

@@ -1,8 +1,11 @@
 {
   "crons": [
+    { "path": "/api/cron/nrd", "schedule": "0 2 * * *" },
+    { "path": "/api/cron/relay", "schedule": "0 3 * * *" },
     { "path": "/api/cron/weedmaps", "schedule": "0 4 * * *" },
     { "path": "/api/cron/business", "schedule": "0 5 * * *" },
     { "path": "/api/cron/ingest", "schedule": "0 6 * * *" },
+    { "path": "/api/cron/batch?limit=50", "schedule": "0 8 * * *" },
     { "path": "/api/cron", "schedule": "0 14 * * *" }
   ]
 }
