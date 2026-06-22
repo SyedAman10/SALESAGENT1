@@ -2154,7 +2154,7 @@ Structure (research-backed — follow exactly):
 
 Rules (strict):
 - 50–90 words total. One ask only.
-- Subject: 3–6 words, personalized with their company or what they're building, no buzzwords (bad: "domain opportunity", good: "${match.domain} — quick question").
+- Subject: 3–6 words, personalized with their company or what they're building. BANNED words/phrases in subject: "opportunity", "another", "one more", "you might like", "thought of you", "just wanted", "checking in", "following up", "quick question", "domain for sale". Good: "${match.domain} — [specific angle]". Bad: "Another domain you might like".
 ${isUpgradeBuyer ? `- Open with: "I noticed you're on ${rawData.upgrade_from}..." — this is your hook, use it` : ''}
 - Vary your wording — never use the phrases "screams", "premium brandable", or any phrase that sounds like a listing.
 - Sign as ${config.fromName}
@@ -2233,7 +2233,7 @@ ${originalBody.slice(0, 300)}
 """
 
 Instruction: ${angles[day]}
-Rules: under 80 words, sign as ${config.fromName}, no spam trigger words, sounds human not automated, do not repeat the original pitch verbatim
+Rules: under 80 words, sign as ${config.fromName}, no spam trigger words, sounds human not automated, do not repeat the original pitch verbatim. Subject must NOT contain: "another", "following up", "checking in", "just wanted", "you might like" — write a fresh angle instead.
 
 Return JSON: {"subject": "...", "body": "..."}
 Return valid JSON only.`;
@@ -3135,12 +3135,12 @@ async function buildSendQueue(): Promise<SendItem[]> {
     ORDER BY l.tier ASC, l.score DESC
   ` as (SendItem & { lead_email: string; lead_score: number })[];
 
-  // Same email address should only get one domain pitch per 30-day window — sending
-  // multiple pitches to the same person burns the relationship and sender reputation.
+  // One person = one domain pitch, ever. Sending multiple domain pitches to the
+  // same person destroys trust and tanks sender reputation.
   const recentlyContacted = new Set<string>(
     ((await sql`
       SELECT DISTINCT l.email FROM leads l INNER JOIN emails e ON e.lead_id = l.id
-      WHERE e.status = 'sent' AND e.sequence_day = 1 AND e.sent_at > NOW() - INTERVAL '30 days'
+      WHERE e.status = 'sent' AND e.sequence_day = 1
     ` as { email: string }[])).map(r => r.email)
   );
   const seenEmail = new Set<string>();
