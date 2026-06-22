@@ -2106,9 +2106,9 @@ async function researchCompany(email: string, company: string | null, rawData: s
 }
 
 const variantInstructions = {
-  direct: 'Get straight to the point. Domain, price, why it fits. No fluff.',
-  curious: 'Open with a thought-provoking question about their niche before introducing the domain.',
-  'value-led': 'Lead with the value the domain unlocks before mentioning price.',
+  direct: 'One human reaching out to another. Specific observation → domain fit → soft ask. No fluff, no preamble, no selling.',
+  curious: 'Open with a genuine observation about their business that proves research — not a pitch. Let real curiosity about their work be the hook. The domain is secondary; the conversation is primary. Sound like a colleague, not a sales tool.',
+  'value-led': 'Lead with the business outcome the domain unlocks for them specifically — not what the domain is, but what it does for their brand. One comp sale as a credibility anchor (not a price anchor).',
 };
 
 function emailPrompt(lead: LeadRow, enrichment: LeadEnrichment, match: { domain: string; relevance_reasoning: string }, variant: string, analysis: DomainAnalysis | null, companyContext?: string) {
@@ -2147,16 +2147,18 @@ Buyer signals: ${enrichment.key_signals.join('; ')}
 Domain fit: ${match.domain} — ${match.relevance_reasoning}${domainInsights}${companySnippet}${upgradeContext}${storefrontLine}
 Style: ${variantInstructions[variant as keyof typeof variantInstructions]}
 
-Structure (research-backed — follow exactly):
-1. First line: a specific observation about THEIR business that proves research (from the company snippet/signals). Never open with the domain or "I".
-2. Bridge: why this domain fits what THEY are building — buyer-centric, not domain-centric. One comp sale max as a credibility anchor.
-3. One low-commitment, concrete CTA (e.g. "worth a couple of minutes this week?" / "want me to hold it while you check with your team?") — never a bare "interested?" or "would this be a fit?". Do NOT include any price.
+Structure (follow exactly — research-backed for 6-9% reply rates):
+1. Line 1 — Specific observation about THEIR business that proves research. Never open with "I", the domain name, or "I own". Pull from the company snippet or buyer signals.
+2. Lines 2-3 — Bridge: connect ${match.domain} to what they are building RIGHT NOW, buyer-centric not domain-centric. Optionally add one comparable sale as a credibility anchor (e.g. "similar domains in this space have sold for $X") — never as a price anchor.
+3. Line 4 — Soft CTA. Specific and low-friction: "worth 5 minutes this week?" / "want me to hold it while you check with your team?" / "does this fit what you're building?" NEVER: "are you interested?", "would this be a fit?", "let me know".
 
-Rules (strict):
-- 50–90 words total. One ask only.
-- Subject: 3–6 words, personalized with their company or what they're building. BANNED words/phrases in subject: "opportunity", "another", "one more", "you might like", "thought of you", "just wanted", "checking in", "following up", "quick question", "domain for sale". Good: "${match.domain} — [specific angle]". Bad: "Another domain you might like".
+Rules (strict — every violation hurts reply rate):
+- 50–90 words total. One ask only. Plain text, no formatting.
+- Subject formula: "${match.domain} — [one specific angle about their business]". Always name the domain. Keep it 2-6 words after the dash. Lowercase preferred.
+- BANNED subject words: "opportunity", "another", "one more", "you might like", "thought of you", "just wanted", "checking in", "following up", "quick question", "domain for sale", "premium", "brandable".
+- BANNED body phrases: "screams", "premium brandable", "perfect domain", "act now", "limited time", "click here", "I own a domain".
+- No links, no HTML, no price.
 ${isUpgradeBuyer ? `- Open with: "I noticed you're on ${rawData.upgrade_from}..." — this is your hook, use it` : ''}
-- Vary your wording — never use the phrases "screams", "premium brandable", or any phrase that sounds like a listing.
 - Sign as ${config.fromName}
 
 Return JSON only: {"subject": "...", "body": "..."}`;
@@ -2212,10 +2214,10 @@ function followUpPrompt(
     ? ` The sale closes ${formatDeadline(deadline)} — state this plainly as a real deadline, best offer wins.`
     : '';
   const angles: Record<number, string> = {
-    3:  `Brief casual check-in, 2-3 sentences. Mention you reached out a few days ago. No hard sell.${deadlineNote}`,
-    10: `New angle — lead with a specific use case or value prop they may not have considered. 3-4 sentences. Remind them once of the domain and why it fits their business specifically.${deadlineNote}`,
-    17: `Gentle urgency — mention other parties have shown interest and you want to give them first right of refusal. Keep it short and warm.${deadlineNote}`,
-    24: `Closing the file. 2 sentences max. Tell them you're moving on but wanted to give them one final chance. Warm, no pressure, no hard sell — just a clean close.${deadlineNote}`,
+    3:  `2-3 sentences max. Subject must be "re: ${domain}" (lowercase, implies thread continuation). Add one new thought you didn't include in the first email — a use case, a specific brand angle, or a one-line comp sale. Do NOT say "checking in", "following up", or "just wanted to".${deadlineNote}`,
+    10: `New angle entirely — lead with a specific use case or business outcome they may not have considered. 3-4 sentences. Subject: a fresh angle, not a variation of the first subject. Something like "${domain} — [new angle]".${deadlineNote}`,
+    17: `Gentle, honest urgency — one other party has shown interest, giving them first right of refusal before you move forward. 2-3 sentences. Subject: "${lead.name.split(' ')[0]} — still available". Warm, no pressure.${deadlineNote}`,
+    24: `Clean close, 2 sentences max. You're moving on but wanted to give them one final shot. Subject: "closing this out". Warm, zero guilt, zero hard sell — just a human closing the loop.${deadlineNote}`,
   };
   const domainContext = analysis
     ? `Domain: ${domain}\nOne-liner: ${analysis.one_liner}\nHook: ${analysis.email_hooks[day === 10 ? 1 : 0] ?? analysis.email_hooks[0]}`
